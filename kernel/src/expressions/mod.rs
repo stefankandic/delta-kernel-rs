@@ -190,6 +190,62 @@ pub type OpaquePredicateOpRef = Arc<dyn OpaquePredicateOp>;
 // Expressions and predicates
 ////////////////////////////////////////////////////////////////////////
 
+/// Context information for expression evaluation.
+///
+/// Contains settings that affect how expressions are evaluated, such as collation
+/// for string comparisons. This provides an extensible way to add evaluation context
+/// without modifying expression structures.
+///
+/// # Examples
+///
+/// ```ignore
+/// use delta_kernel::expressions::ExprContext;
+/// use delta_kernel::collation::CollationIdentifier;
+///
+/// // Default context (no special settings)
+/// let ctx = ExprContext::new();
+///
+/// // Context with collation
+/// let ctx = ExprContext::with_collation(CollationIdentifier::spark("UTF8_LCASE"));
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExprContext {
+    /// Collation for string comparisons.
+    ///
+    /// If `None`, uses default binary (byte-wise) comparison.
+    pub collation: Option<crate::collation::CollationIdentifier>,
+
+    // Future context fields can be added here without breaking changes:
+    // pub timezone: Option<String>,
+    // pub locale: Option<String>,
+    // pub decimal_precision: Option<u8>,
+}
+
+impl ExprContext {
+    /// Creates a new expression context with default settings.
+    pub fn new() -> Self {
+        Self { collation: None }
+    }
+
+    /// Creates an expression context with the specified collation.
+    pub fn with_collation(collation: crate::collation::CollationIdentifier) -> Self {
+        Self {
+            collation: Some(collation),
+        }
+    }
+
+    /// Returns the collation from this context, if present.
+    pub fn collation(&self) -> Option<&crate::collation::CollationIdentifier> {
+        self.collation.as_ref()
+    }
+}
+
+impl Default for ExprContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnaryPredicate {
     /// The operator.
@@ -206,6 +262,11 @@ pub struct BinaryPredicate {
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
     pub right: Box<Expression>,
+    /// Optional expression evaluation context.
+    ///
+    /// Contains settings like collation that affect how the comparison is evaluated.
+    /// If `None`, uses default evaluation settings (binary comparison for strings).
+    pub context: Option<ExprContext>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -501,7 +562,20 @@ impl BinaryPredicate {
     ) -> Self {
         let left = Box::new(left.into());
         let right = Box::new(right.into());
-        Self { op, left, right }
+        Self { op, left, right, context: None }
+    }
+
+    /// Sets the expression context for this predicate (builder pattern).
+    pub fn with_context(mut self, context: ExprContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// Convenience method to set the collation for this predicate (builder pattern).
+    ///
+    /// This is equivalent to `with_context(ExprContext::with_collation(collation))`.
+    pub fn with_collation(self, collation: crate::collation::CollationIdentifier) -> Self {
+        self.with_context(ExprContext::with_collation(collation))
     }
 }
 
@@ -608,6 +682,75 @@ impl Expression {
     /// Create a new predicate `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Predicate {
         Predicate::distinct(self, other)
+    }
+
+    /// Create a new predicate `self == other` with the specified collation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use delta_kernel::collation::CollationIdentifier;
+    /// let pred = col("name").eq_collated("Alice", CollationIdentifier::spark("UTF8_LCASE"));
+    /// ```
+    pub fn eq_collated(
+        self,
+        other: impl Into<Self>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Predicate {
+        Predicate::eq_collated(self, other, collation)
+    }
+
+    /// Create a new predicate `self < other` with the specified collation.
+    pub fn lt_collated(
+        self,
+        other: impl Into<Self>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Predicate {
+        Predicate::lt_collated(self, other, collation)
+    }
+
+    /// Create a new predicate `self > other` with the specified collation.
+    pub fn gt_collated(
+        self,
+        other: impl Into<Self>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Predicate {
+        Predicate::gt_collated(self, other, collation)
+    }
+
+    /// Create a new predicate `self <= other` with the specified collation.
+    pub fn le_collated(
+        self,
+        other: impl Into<Self>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Predicate {
+        Predicate::le_collated(self, other, collation)
+    }
+
+    /// Create a new predicate `self >= other` with the specified collation.
+    pub fn ge_collated(
+        self,
+        other: impl Into<Self>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Predicate {
+        Predicate::ge_collated(self, other, collation)
+    }
+
+    /// Create a new predicate `self != other` with the specified collation.
+    pub fn ne_collated(
+        self,
+        other: impl Into<Self>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Predicate {
+        Predicate::ne_collated(self, other, collation)
+    }
+
+    /// Create a new predicate `DISTINCT(self, other)` with the specified collation.
+    pub fn distinct_collated(
+        self,
+        other: impl Into<Self>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Predicate {
+        Predicate::distinct_collated(self, other, collation)
     }
 
     /// Creates a new unary expression
@@ -730,6 +873,103 @@ impl Predicate {
         Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
+    /// Attaches an expression context to this predicate (builder pattern).
+    ///
+    /// For binary predicates, this sets the evaluation context. For other predicates,
+    /// this is a no-op (context only applies to binary predicates).
+    ///
+    /// # Example
+    /// ```ignore
+    /// use delta_kernel::expressions::ExprContext;
+    /// use delta_kernel::collation::CollationIdentifier;
+    /// let ctx = ExprContext::with_collation(CollationIdentifier::spark("UTF8_LCASE"));
+    /// let pred = Predicate::eq(col("name"), "Alice").with_context(ctx);
+    /// ```
+    pub fn with_context(self, context: ExprContext) -> Self {
+        match self {
+            Self::Binary(bp) => Self::Binary(bp.with_context(context)),
+            other => other, // Context only applies to binary predicates
+        }
+    }
+
+    /// Convenience method to attach a collation to this predicate (builder pattern).
+    ///
+    /// This is equivalent to `with_context(ExprContext::with_collation(collation))`.
+    /// For binary predicates, this sets the collation. For other predicates, this is a no-op.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use delta_kernel::collation::CollationIdentifier;
+    /// let pred = Predicate::eq(col("name"), "Alice")
+    ///     .with_collation(CollationIdentifier::spark("UTF8_LCASE"));
+    /// ```
+    pub fn with_collation(self, collation: crate::collation::CollationIdentifier) -> Self {
+        self.with_context(ExprContext::with_collation(collation))
+    }
+
+    /// Create a new predicate `a == b` with the specified collation.
+    pub fn eq_collated(
+        a: impl Into<Expression>,
+        b: impl Into<Expression>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Self {
+        Self::eq(a, b).with_collation(collation)
+    }
+
+    /// Create a new predicate `a < b` with the specified collation.
+    pub fn lt_collated(
+        a: impl Into<Expression>,
+        b: impl Into<Expression>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Self {
+        Self::lt(a, b).with_collation(collation)
+    }
+
+    /// Create a new predicate `a > b` with the specified collation.
+    pub fn gt_collated(
+        a: impl Into<Expression>,
+        b: impl Into<Expression>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Self {
+        Self::gt(a, b).with_collation(collation)
+    }
+
+    /// Create a new predicate `a <= b` with the specified collation.
+    pub fn le_collated(
+        a: impl Into<Expression>,
+        b: impl Into<Expression>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Self {
+        Self::le(a, b).with_collation(collation)
+    }
+
+    /// Create a new predicate `a >= b` with the specified collation.
+    pub fn ge_collated(
+        a: impl Into<Expression>,
+        b: impl Into<Expression>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Self {
+        Self::ge(a, b).with_collation(collation)
+    }
+
+    /// Create a new predicate `a != b` with the specified collation.
+    pub fn ne_collated(
+        a: impl Into<Expression>,
+        b: impl Into<Expression>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Self {
+        Self::ne(a, b).with_collation(collation)
+    }
+
+    /// Create a new predicate `DISTINCT(a, b)` with the specified collation.
+    pub fn distinct_collated(
+        a: impl Into<Expression>,
+        b: impl Into<Expression>,
+        collation: crate::collation::CollationIdentifier,
+    ) -> Self {
+        Self::distinct(a, b).with_collation(collation)
+    }
+
     /// Create a new predicate `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
@@ -766,6 +1006,7 @@ impl Predicate {
             op,
             left: Box::new(lhs.into()),
             right: Box::new(rhs.into()),
+            context: None,
         })
     }
 
@@ -912,8 +1153,30 @@ impl Display for Predicate {
                 op: BinaryPredicateOp::Distinct,
                 left,
                 right,
-            }) => write!(f, "DISTINCT({left}, {right})"),
-            Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
+                context,
+            }) => {
+                write!(f, "DISTINCT({left}, {right})")?;
+                if let Some(ctx) = context {
+                    if let Some(coll) = &ctx.collation {
+                        write!(f, " COLLATE {coll}")?;
+                    }
+                }
+                Ok(())
+            }
+            Binary(BinaryPredicate {
+                op,
+                left,
+                right,
+                context,
+            }) => {
+                write!(f, "{left} {op} {right}")?;
+                if let Some(ctx) = context {
+                    if let Some(coll) = &ctx.collation {
+                        write!(f, " COLLATE {coll}")?;
+                    }
+                }
+                Ok(())
+            }
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
             },

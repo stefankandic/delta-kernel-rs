@@ -498,6 +498,49 @@ impl Scalar {
             (Map(_), _) => None,  // TODO: Support Map?
         }
     }
+
+    /// Performs a logical comparison with collation support for strings.
+    ///
+    /// For string values, validates and applies the collation. Currently only
+    /// `spark:UTF8_BINARY` is supported, which performs standard binary comparison.
+    ///
+    /// For non-string values, collation is ignored and standard comparison is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collation is not supported.
+    pub fn logical_partial_cmp_collated(
+        &self,
+        other: &Self,
+        collation: &crate::collation::CollationIdentifier,
+    ) -> crate::DeltaResult<Option<std::cmp::Ordering>> {
+        use Scalar::*;
+
+        match (self, other) {
+            (String(a), String(b)) => {
+                // Validate collation is supported
+                collation.validate_support()?;
+
+                // Since we only support UTF8_BINARY, just do standard comparison
+                Ok(a.partial_cmp(b))
+            }
+            // For non-strings, ignore collation and use standard comparison
+            _ => Ok(self.logical_partial_cmp(other)),
+        }
+    }
+
+    /// Checks logical equality with collation support for strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collation is not supported.
+    pub fn logical_eq_collated(
+        &self,
+        other: &Self,
+        collation: &crate::collation::CollationIdentifier,
+    ) -> crate::DeltaResult<bool> {
+        Ok(self.logical_partial_cmp_collated(other, collation)? == Some(std::cmp::Ordering::Equal))
+    }
 }
 
 impl From<i8> for Scalar {
@@ -1292,5 +1335,97 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+    }
+
+    #[test]
+    fn test_collated_comparison_utf8_binary() {
+        use crate::collation::CollationIdentifier;
+
+        let collation = CollationIdentifier::spark("UTF8_BINARY");
+
+        // Test equality - UTF8_BINARY should be case-sensitive (normal binary comparison)
+        let alice = Scalar::from("Alice");
+        let alice2 = Scalar::from("Alice");
+        let alice_lower = Scalar::from("alice");
+
+        // Same string should be equal
+        let result = alice.logical_eq_collated(&alice2, &collation);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // Different case should NOT be equal (binary comparison)
+        let result = alice.logical_eq_collated(&alice_lower, &collation);
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+
+        // Test ordering - UTF8_BINARY should use normal binary comparison
+        let a_str = Scalar::from("A");
+        let b_str = Scalar::from("B");
+        let a_lower = Scalar::from("a");
+
+        let result = a_str.logical_partial_cmp_collated(&b_str, &collation);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(std::cmp::Ordering::Less));
+
+        // In binary comparison, uppercase letters come before lowercase
+        let result = a_str.logical_partial_cmp_collated(&a_lower, &collation);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(std::cmp::Ordering::Less));
+    }
+
+    #[test]
+    fn test_collated_comparison_unsupported() {
+        use crate::collation::CollationIdentifier;
+
+        // Test UTF8_LCASE - should fail
+        let collation = CollationIdentifier::spark("UTF8_LCASE");
+        let alice = Scalar::from("Alice");
+        let alice_lower = Scalar::from("alice");
+
+        let result = alice.logical_eq_collated(&alice_lower, &collation);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains("UTF8_LCASE"));
+
+        // Test ICU collation - should fail
+        let collation = CollationIdentifier::icu("de_DE", Some("75.1".to_string()));
+        let result = alice.logical_eq_collated(&alice_lower, &collation);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains("icu:de_DE:75.1"));
+
+        // Test partial_cmp_collated also fails
+        let collation = CollationIdentifier::spark("UTF8_LCASE");
+        let result = alice.logical_partial_cmp_collated(&alice_lower, &collation);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn test_collated_comparison_non_strings() {
+        use crate::collation::CollationIdentifier;
+
+        let collation = CollationIdentifier::spark("UTF8_BINARY");
+
+        // Collation should not affect non-string types - they should use normal comparison
+        let num1 = Scalar::from(42);
+        let num2 = Scalar::from(100);
+
+        let result = num1.logical_partial_cmp_collated(&num2, &collation);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(std::cmp::Ordering::Less));
+
+        let result = num1.logical_eq_collated(&num2, &collation);
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+
+        // Test with same value
+        let num3 = Scalar::from(42);
+        let result = num1.logical_eq_collated(&num3, &collation);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
     }
 }

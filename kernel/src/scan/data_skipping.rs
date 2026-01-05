@@ -279,9 +279,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, context, inverted)
             .map(Pred::literal)
     }
 

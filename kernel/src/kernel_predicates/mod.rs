@@ -95,16 +95,34 @@ pub trait KernelPredicateEvaluator {
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output>;
 
     /// A (possibly inverted) less-than comparison, e.g. `<col> < <value>`.
-    fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+    fn eval_pred_lt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output>;
 
     /// A (possibly inverted) greater-than comparison, e.g. `<col> > <value>`
-    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+    fn eval_pred_gt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output>;
 
     /// A (possibly inverted) equality comparison, e.g. `<col> = <value>` or `<col> != <value>`.
     ///
     /// NOTE: Caller is responsible to commute the operation if needed, e.g. `<value> != <col>`
     /// becomes `<col> != <value>`.
-    fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+    fn eval_pred_eq(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output>;
 
     /// A (possibly inverted) comparison between two scalars, e.g. `<valueA> != <valueB>`.
     fn eval_pred_binary_scalars(
@@ -112,6 +130,7 @@ pub trait KernelPredicateEvaluator {
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -121,6 +140,7 @@ pub trait KernelPredicateEvaluator {
         op: BinaryPredicateOp,
         a: &ColumnName,
         b: &ColumnName,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -158,7 +178,7 @@ pub trait KernelPredicateEvaluator {
     fn eval_pred_column(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output> {
         // The expression <col> is equivalent to <col> != FALSE, and the expression NOT <col> is
         // equivalent to <col> != TRUE.
-        self.eval_pred_eq(col, &Scalar::from(inverted), true)
+        self.eval_pred_eq(col, &Scalar::from(inverted), None, true)
     }
 
     /// Dispatches a (possibly inverted) NOT predicate
@@ -226,6 +246,7 @@ pub trait KernelPredicateEvaluator {
         &self,
         col: &ColumnName,
         val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<Self::Output> {
         if let Scalar::Null(_) = val {
@@ -233,7 +254,7 @@ pub trait KernelPredicateEvaluator {
         } else {
             let mut args = [
                 self.eval_pred_is_null(col, inverted),
-                self.eval_pred_eq(col, val, !inverted),
+                self.eval_pred_eq(col, val, context, !inverted),
             ]
             .into_iter();
             self.finish_eval_pred_junction(JunctionPredicateOp::Or, &mut args, inverted)
@@ -247,6 +268,7 @@ pub trait KernelPredicateEvaluator {
         &self,
         _col: &ColumnName,
         _val: &Scalar,
+        _context: Option<&crate::expressions::ExprContext>,
         _inverted: bool,
     ) -> Option<Self::Output> {
         None // TODO?
@@ -260,27 +282,28 @@ pub trait KernelPredicateEvaluator {
         op: BinaryPredicateOp,
         left: &Expr,
         right: &Expr,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<Self::Output> {
         use BinaryPredicateOp::*;
         use Expr::{Column, Literal};
 
         match (left, right) {
-            (Column(a), Column(b)) => self.eval_pred_binary_columns(op, a, b, inverted),
-            (Literal(a), Literal(b)) => self.eval_pred_binary_scalars(op, a, b, inverted),
+            (Column(a), Column(b)) => self.eval_pred_binary_columns(op, a, b, context, inverted),
+            (Literal(a), Literal(b)) => self.eval_pred_binary_scalars(op, a, b, context, inverted),
             (Column(col), Literal(val)) => match op {
-                LessThan => self.eval_pred_lt(col, val, inverted),
-                GreaterThan => self.eval_pred_gt(col, val, inverted),
-                Equal => self.eval_pred_eq(col, val, inverted),
-                Distinct => self.eval_pred_distinct(col, val, inverted),
-                In => self.eval_pred_in(col, val, inverted),
+                LessThan => self.eval_pred_lt(col, val, context, inverted),
+                GreaterThan => self.eval_pred_gt(col, val, context, inverted),
+                Equal => self.eval_pred_eq(col, val, context, inverted),
+                Distinct => self.eval_pred_distinct(col, val, context, inverted),
+                In => self.eval_pred_in(col, val, context, inverted),
             },
             (Literal(val), Column(col)) => match op {
                 // NOTE: The column has to be on the left, so e.g. `10 < x` becomes `x > 10`
-                LessThan => self.eval_pred_gt(col, val, inverted),
-                GreaterThan => self.eval_pred_lt(col, val, inverted),
-                Equal => self.eval_pred_eq(col, val, inverted),
-                Distinct => self.eval_pred_distinct(col, val, inverted),
+                LessThan => self.eval_pred_gt(col, val, context, inverted),
+                GreaterThan => self.eval_pred_lt(col, val, context, inverted),
+                Equal => self.eval_pred_eq(col, val, context, inverted),
+                Distinct => self.eval_pred_distinct(col, val, context, inverted),
                 In => None, // arg order is semantically important
             },
             _ => {
@@ -309,8 +332,13 @@ pub trait KernelPredicateEvaluator {
             BooleanExpression(expr) => self.eval_pred_expr(expr, inverted),
             Not(pred) => self.eval_pred_not(pred, inverted),
             Unary(UnaryPredicate { op, expr }) => self.eval_pred_unary(*op, expr, inverted),
-            Binary(BinaryPredicate { op, left, right }) => {
-                self.eval_pred_binary(*op, left, right, inverted)
+            Binary(BinaryPredicate {
+                op,
+                left,
+                right,
+                context,
+            }) => {
+                self.eval_pred_binary(*op, left, right, context.as_ref(), inverted)
             }
             Junction(JunctionPredicate { op, preds }) => {
                 self.eval_pred_junction(*op, preds, inverted)
@@ -432,12 +460,17 @@ pub trait KernelPredicateEvaluator {
                     .map(|pred| self.eval_pred_sql_where(pred, inverted));
                 self.finish_eval_pred_junction(*op, &mut preds, inverted)
             }
-            Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {
+            Binary(BinaryPredicate {
+                op,
+                left,
+                right,
+                context,
+            }) if op.is_null_intolerant() => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_binary`
                 let mut preds = [
                     self.eval_pred_unary(UnaryPredicateOp::IsNull, left, true),
                     self.eval_pred_unary(UnaryPredicateOp::IsNull, right, true),
-                    self.eval_pred_binary(*op, left, right, inverted),
+                    self.eval_pred_binary(*op, left, right, context.as_ref(), inverted),
                 ]
                 .into_iter();
                 self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
@@ -522,9 +555,17 @@ impl KernelPredicateEvaluatorDefaults {
         ord: Ordering,
         a: &Scalar,
         b: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<bool> {
-        let cmp = a.logical_partial_cmp(b)?;
+        let collation = context.and_then(|ctx| ctx.collation.as_ref());
+        let cmp = if let Some(collation) = collation {
+            // Use collation-aware comparison (may error for unsupported collations)
+            a.logical_partial_cmp_collated(b, collation).ok()?
+        } else {
+            // Use standard comparison
+            Some(a.logical_partial_cmp(b)?)
+        }?;
         let matched = cmp == ord;
         Some(matched != inverted)
     }
@@ -534,13 +575,16 @@ impl KernelPredicateEvaluatorDefaults {
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<bool> {
         use BinaryPredicateOp::*;
         match op {
-            Equal => Self::partial_cmp_scalars(Ordering::Equal, left, right, inverted),
-            LessThan => Self::partial_cmp_scalars(Ordering::Less, left, right, inverted),
-            GreaterThan => Self::partial_cmp_scalars(Ordering::Greater, left, right, inverted),
+            Equal => Self::partial_cmp_scalars(Ordering::Equal, left, right, context, inverted),
+            LessThan => Self::partial_cmp_scalars(Ordering::Less, left, right, context, inverted),
+            GreaterThan => {
+                Self::partial_cmp_scalars(Ordering::Greater, left, right, context, inverted)
+            }
             Distinct | In => {
                 debug!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None
@@ -669,19 +713,37 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         self.eval_pred_scalar_is_null(&col, inverted)
     }
 
-    fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
+    fn eval_pred_lt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_pred_binary_scalars(BinaryPredicateOp::LessThan, &col, val, inverted)
+        self.eval_pred_binary_scalars(BinaryPredicateOp::LessThan, &col, val, context, inverted)
     }
 
-    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
+    fn eval_pred_gt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_pred_binary_scalars(BinaryPredicateOp::GreaterThan, &col, val, inverted)
+        self.eval_pred_binary_scalars(BinaryPredicateOp::GreaterThan, &col, val, context, inverted)
     }
 
-    fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
+    fn eval_pred_eq(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &col, val, inverted)
+        self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &col, val, context, inverted)
     }
 
     fn eval_pred_binary_scalars(
@@ -689,9 +751,10 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, context, inverted)
     }
 
     fn eval_pred_binary_columns(
@@ -699,11 +762,12 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         op: BinaryPredicateOp,
         left: &ColumnName,
         right: &ColumnName,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<bool> {
         let left = self.resolve_column(left)?;
         let right = self.resolve_column(right)?;
-        self.eval_pred_binary_scalars(op, &left, &right, inverted)
+        self.eval_pred_binary_scalars(op, &left, &right, context, inverted)
     }
 
     fn eval_pred_opaque(
@@ -796,6 +860,7 @@ pub trait DataSkippingPredicateEvaluator {
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -852,7 +917,15 @@ pub trait DataSkippingPredicateEvaluator {
     }
 
     /// See [`KernelPredicateEvaluator::eval_pred_lt`]
-    fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+    fn eval_pred_lt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        _context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        // Note: Stats-based skipping uses binary comparison regardless of collation.
+        // This is conservative - we may keep files that could be skipped with collation-aware stats.
         if inverted {
             // Given `col >= val`:
             // Skip if `val is greater than _every_ value in [min, max], implies
@@ -874,7 +947,15 @@ pub trait DataSkippingPredicateEvaluator {
     }
 
     /// See [`KernelPredicateEvaluator::eval_pred_gt`]
-    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+    fn eval_pred_gt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        _context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        // Note: Stats-based skipping uses binary comparison regardless of collation.
+        // This is conservative - we may keep files that could be skipped with collation-aware stats.
         if inverted {
             // Given `col <= val`:
             // Skip if `val` is less than _all_ values in [min, max], implies
@@ -896,7 +977,15 @@ pub trait DataSkippingPredicateEvaluator {
     }
 
     /// See [`KernelPredicateEvaluator::eval_pred_eq`]
-    fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+    fn eval_pred_eq(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        _context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        // Note: Stats-based skipping uses binary comparison regardless of collation.
+        // This is conservative - we may keep files that could be skipped with collation-aware stats.
         let (op, preds) = if inverted {
             // Column could compare not-equal if min or max value differs from the literal.
             let preds = [
@@ -931,16 +1020,34 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         self.eval_pred_is_null(col, inverted)
     }
 
-    fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
-        self.eval_pred_lt(col, val, inverted)
+    fn eval_pred_lt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        self.eval_pred_lt(col, val, context, inverted)
     }
 
-    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
-        self.eval_pred_gt(col, val, inverted)
+    fn eval_pred_gt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        self.eval_pred_gt(col, val, context, inverted)
     }
 
-    fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
-        self.eval_pred_eq(col, val, inverted)
+    fn eval_pred_eq(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        self.eval_pred_eq(col, val, context, inverted)
     }
 
     fn eval_pred_binary_scalars(
@@ -948,9 +1055,10 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<Self::Output> {
-        self.eval_pred_binary_scalars(op, left, right, inverted)
+        self.eval_pred_binary_scalars(op, left, right, context, inverted)
     }
 
     // NOTE: We rely on the literal values to provide logical type hints. That means we cannot
@@ -960,6 +1068,7 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         _op: BinaryPredicateOp,
         _a: &ColumnName,
         _b: &ColumnName,
+        _context: Option<&crate::expressions::ExprContext>,
         _inverted: bool,
     ) -> Option<Self::Output> {
         None
