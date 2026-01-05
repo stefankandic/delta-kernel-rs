@@ -651,7 +651,7 @@ fn visit_predicate_impl(
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
-        Predicate::Binary(BinaryPredicate { op, left, right }) => {
+        Predicate::Binary(BinaryPredicate { op, left, right, .. }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
             visit_expression_impl(visitor, right, child_list_id);

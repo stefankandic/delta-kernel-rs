@@ -58,7 +58,7 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         val: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
+        KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, None, inverted)
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
@@ -84,9 +84,10 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, context, inverted)
     }
 
     fn eval_pred_opaque(

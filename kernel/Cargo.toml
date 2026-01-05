@@ -56,6 +56,14 @@ url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 
+# ICU collation support (required)
+# Requires ICU 75.x installed on the system
+rust_icu_ucol = { version = "5.4", features = ["use-bindgen"] }
+rust_icu_ustring = { version = "5.4", features = ["use-bindgen"] }
+rust_icu_uchar = { version = "5.4", features = ["use-bindgen"] }
+rust_icu_sys = { version = "5.4", features = ["use-bindgen"] }
+rust_icu_common = { version = "5.4", features = ["use-bindgen"] }
+
 # optional deps
 futures = { version = "0.3", optional = true }
 # Used for fetching direct urls (like pre-signed urls)

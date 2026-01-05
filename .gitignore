@@ -19,3 +19,6 @@ ffi/examples/read-table/build
 /build
 /kernel/target
 /target
+
+# Local ICU installation
+/.icu/

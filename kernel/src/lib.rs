@@ -87,6 +87,8 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod collation;
+pub mod collation_factory;
 pub mod committer;
 pub mod engine_data;
 pub mod error;

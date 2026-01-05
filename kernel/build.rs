@@ -1,3 +1,6 @@
+#[path = "icu_build.rs"]
+mod icu_build;
+
 use rustc_version::{version_meta, Channel};
 
 fn main() {
@@ -6,4 +9,6 @@ fn main() {
     if let Channel::Nightly = version_meta().unwrap().channel {
         println!("cargo:rustc-cfg=NIGHTLY_CHANNEL");
     }
+
+    icu_build::setup();
 }
