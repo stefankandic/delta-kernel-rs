@@ -1038,6 +1038,48 @@ impl Predicate {
         }
     }
 
+    /// Validates that all collations in this predicate are version-compatible with the kernel.
+    ///
+    /// Unlike `for_parquet_row_group_filter` which conservatively drops incompatible predicates,
+    /// this method is used for operations like partition filtering where using an incompatible
+    /// collation would be incorrect and unsafe, so we must fail the query.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::CollationVersionMismatch` if any collation in the predicate tree has
+    /// a version that doesn't match the kernel's ICU version.
+    pub fn check_collation_versions(&self) -> crate::DeltaResult<()> {
+        use crate::Error;
+
+        match self {
+            Self::Binary(bp) => {
+                if let Some(ref context) = bp.context {
+                    if let Some(ref collation) = context.collation {
+                        if !collation.is_version_compatible() {
+                            let version_str = collation.version.as_ref()
+                                .map(|v| v.as_str())
+                                .unwrap_or("None");
+                            return Err(Error::collation_version_mismatch(format!(
+                                "Collation '{}' uses ICU version '{}', but kernel supports version '{}'. \
+                                 Cannot safely perform partition filtering with incompatible collation version.",
+                                collation, version_str, &*crate::collation_factory::ICU_VERSION
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Self::Junction(jp) => {
+                for pred in &jp.preds {
+                    pred.check_collation_versions()?;
+                }
+                Ok(())
+            }
+            Self::Not(pred) => pred.check_collation_versions(),
+            Self::Unary(_) | Self::BooleanExpression(_) | Self::Opaque(_) | Self::Unknown(_) => Ok(()),
+        }
+    }
+
     /// Create a new predicate `a == b` with the specified collation.
     pub fn eq_collated(
         a: impl Into<Expression>,

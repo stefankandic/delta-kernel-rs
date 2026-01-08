@@ -134,19 +134,25 @@ impl AddRemoveDedupVisitor<'_> {
     fn is_file_partition_pruned(
         &self,
         partition_values: &HashMap<usize, (String, Scalar)>,
-    ) -> bool {
+    ) -> DeltaResult<bool> {
         if partition_values.is_empty() {
-            return false;
+            return Ok(false);
         }
         let Some(partition_filter) = &self.partition_filter else {
-            return false;
+            return Ok(false);
         };
+
+        // Version check is required here because the predicate evaluator converts errors to None
+        // (treating them as "can't determine, keep the file"). For partition filtering, we must
+        // fail on version mismatch to prevent data leakage from incorrect filtering.
+        partition_filter.check_collation_versions()?;
+
         let partition_values: HashMap<_, _> = partition_values
             .values()
             .map(|(k, v)| (ColumnName::new([k]), v.clone()))
             .collect();
         let evaluator = DefaultKernelPredicateEvaluator::from(partition_values);
-        evaluator.eval_sql_where(partition_filter) == Some(false)
+        Ok(evaluator.eval_sql_where(partition_filter) == Some(false))
     }
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
@@ -183,7 +189,7 @@ impl AddRemoveDedupVisitor<'_> {
                     &partition_values,
                     self.state_info.column_mapping_mode,
                 )?;
-                if self.is_file_partition_pruned(&partition_values) {
+                if self.is_file_partition_pruned(&partition_values)? {
                     return Ok(false);
                 }
                 partition_values

@@ -501,9 +501,7 @@ impl Scalar {
 
     /// Performs a logical comparison with collation support for strings.
     ///
-    /// For string values, validates and applies the collation. Currently only
-    /// `spark:UTF8_BINARY` is supported, which performs standard binary comparison.
-    ///
+    /// For string values, validates and applies the specified collation.
     /// For non-string values, collation is ignored and standard comparison is used.
     ///
     /// # Errors
@@ -521,8 +519,9 @@ impl Scalar {
                 // Validate collation is supported
                 collation.validate_support()?;
 
-                // Since we only support UTF8_BINARY, just do standard comparison
-                Ok(a.partial_cmp(b))
+                // Use collation-aware comparison
+                let collator = crate::collation_factory::CollationFactory::from_identifier(collation.clone())?;
+                Ok(Some(collator.compare(a, b)?))
             }
             // For non-strings, ignore collation and use standard comparison
             _ => Ok(self.logical_partial_cmp(other)),
@@ -1416,6 +1415,71 @@ mod tests {
         // Test with same value
         let num3 = Scalar::from(42);
         let result = num1.logical_eq_collated(&num3, &collation);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_collated_comparison_utf8_lcase() {
+        use crate::collation::CollationIdentifier;
+
+        let collation = CollationIdentifier::spark("UTF8_LCASE");
+
+        // Test equality - UTF8_LCASE should be case-insensitive
+        let alice_upper = Scalar::from("ALICE");
+        let alice_mixed = Scalar::from("Alice");
+        let alice_lower = Scalar::from("alice");
+
+        // Different cases should be equal with UTF8_LCASE
+        let result = alice_upper.logical_eq_collated(&alice_lower, &collation);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        let result = alice_mixed.logical_eq_collated(&alice_lower, &collation);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // Test ordering - UTF8_LCASE should ignore case in comparisons
+        let a_upper = Scalar::from("A");
+        let b_lower = Scalar::from("b");
+
+        let result = a_upper.logical_partial_cmp_collated(&b_lower, &collation);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(std::cmp::Ordering::Less));
+
+        // Same letters different case should be equal
+        let a_lower = Scalar::from("a");
+        let result = a_upper.logical_partial_cmp_collated(&a_lower, &collation);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(std::cmp::Ordering::Equal));
+    }
+
+    #[test]
+    fn test_collated_comparison_unicode_ci_ai() {
+        use crate::collation::CollationIdentifier;
+
+        let collation = CollationIdentifier::icu("UNICODE_CI_AI".to_string(), None);
+
+        // Test equality - UNICODE_CI_AI should be case-insensitive and accent-insensitive
+        let cafe_accent = Scalar::from("café");
+        let cafe_no_accent = Scalar::from("cafe");
+        let cafe_upper = Scalar::from("CAFÉ");
+
+        // Different cases should be equal
+        let result = cafe_accent.logical_eq_collated(&cafe_upper, &collation);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // With and without accents should be equal
+        let result = cafe_accent.logical_eq_collated(&cafe_no_accent, &collation);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // Test with more examples
+        let resume_accent = Scalar::from("résumé");
+        let resume_no_accent = Scalar::from("resume");
+
+        let result = resume_accent.logical_eq_collated(&resume_no_accent, &collation);
         assert!(result.is_ok());
         assert!(result.unwrap());
     }

@@ -357,3 +357,136 @@ fn test_complex_predicate_version_mismatch_or() -> Result<(), Box<dyn std::error
 
     Ok(())
 }
+
+// ============================================================================
+// Partition Filtering Tests
+// ============================================================================
+
+/// Sets up the partitioned test table and returns the engine and snapshot (wrapped in Arc)
+fn setup_partitioned_table() -> Result<(Arc<dyn Engine>, Arc<Snapshot>), Box<dyn std::error::Error>> {
+    let table_path = std::fs::canonicalize(PathBuf::from("./tests/data/collations-partitioned"))?;
+    let url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    Ok((engine, snapshot))
+}
+
+/// Counts total rows from a scan with the given predicate
+fn count_rows_with_predicate(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn Engine>,
+    predicate: Pred,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use delta_kernel::DeltaResult;
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let total_rows: usize = scan.execute(engine)?
+        .map(|result: DeltaResult<Box<dyn delta_kernel::EngineData>>| -> DeltaResult<usize> {
+            Ok(result?.len())
+        })
+        .collect::<DeltaResult<Vec<usize>>>()?
+        .into_iter()
+        .sum();
+
+    Ok(total_rows)
+}
+
+#[test]
+fn test_partition_filtering_with_collation() -> Result<(), Box<dyn std::error::Error>> {
+    // Partitioned table by name (UTF8_LCASE collation):
+    // Partitions: 'Apple', 'apple', 'APPLE', 'Banana', 'banana', 'ananas', 'PEAR'
+    //
+    // Test that querying with case-insensitive collation finds all case variations
+    //
+    // Data:
+    // - INSERT INTO t2 VALUES (1, 'Apple'), (2, 'Banana')  -- 2 rows
+    // - INSERT INTO t2 VALUES (1, 'apple'), (2, 'banana'), (1, 'APPLE')  -- 3 rows
+    // - INSERT INTO t2 VALUES (3, 'ananas'), (4, 'PEAR')  -- 2 rows
+    //
+    // Query: name = 'apple' with UTF8_LCASE
+    // Should match partitions: 'Apple' (1 row), 'apple' (1 row), 'APPLE' (1 row) = 3 rows total
+
+    let (engine, snapshot) = setup_partitioned_table()?;
+    let collation = CollationIdentifier::spark("UTF8_LCASE");
+
+    // Query: name = 'apple' with UTF8_LCASE collation
+    // Should match partitions: 'Apple', 'apple', 'APPLE'
+    let predicate = column_expr!("name").eq_collated(Expr::literal("apple"), collation);
+
+    let num_rows = count_rows_with_predicate(snapshot.clone(), engine.clone(), predicate)?;
+
+    // Should find all rows where name matches 'apple' (case-insensitive)
+    // Expected: 3 rows from 'Apple', 'apple', and 'APPLE' partitions
+    assert_eq!(
+        num_rows, 3,
+        "Expected 3 rows (from Apple, apple, APPLE partitions), got {}",
+        num_rows
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_partition_filtering_wrong_version_fails() -> Result<(), Box<dyn std::error::Error>> {
+    // Test that partition filtering with wrong collation version FAILS the query
+    // (unlike data skipping which drops the predicate)
+    //
+    // This is important for security: partition filtering must fail on version mismatch
+    // to prevent data leakage from incorrect filtering
+
+    let (engine, snapshot) = setup_partitioned_table()?;
+    let collation = create_wrong_version_collation();
+
+    // Query: name = 'apple' with wrong collation version
+    let predicate = column_expr!("name").eq_collated(Expr::literal("apple"), collation);
+
+    let result = count_rows_with_predicate(snapshot.clone(), engine.clone(), predicate);
+
+    // Should fail with a CollationVersionMismatch error
+    assert!(
+        result.is_err(),
+        "Expected error for partition filtering with wrong collation version, but query succeeded"
+    );
+
+    let error = result.unwrap_err();
+    let error_msg = error.to_string();
+
+    assert!(
+        error_msg.contains("Collation version mismatch") || error_msg.contains("version"),
+        "Expected CollationVersionMismatch error, got: {}",
+        error_msg
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_partition_filtering_binary_collation() -> Result<(), Box<dyn std::error::Error>> {
+    // Test that UTF8_BINARY collation uses exact matching (case-sensitive)
+    //
+    // Query: name = 'apple' with UTF8_BINARY (default, no collation specified)
+    // Should only match the exact 'apple' partition, not 'Apple' or 'APPLE'
+    //
+    // Expected: Only 1 row from 'apple' partition
+
+    let (engine, snapshot) = setup_partitioned_table()?;
+
+    // Query: name = 'apple' with UTF8_BINARY (default)
+    let predicate = column_expr!("name").eq(Expr::literal("apple"));
+
+    let num_rows = count_rows_with_predicate(snapshot.clone(), engine.clone(), predicate)?;
+
+    // Should only find rows from 'apple' partition (case-sensitive)
+    // Expected: 1 row (only exact match 'apple')
+    assert_eq!(
+        num_rows, 1,
+        "Expected 1 row (only 'apple' partition with binary collation), got {}",
+        num_rows
+    );
+
+    Ok(())
+}
