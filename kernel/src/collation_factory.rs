@@ -3,6 +3,11 @@
 //! This module provides the factory pattern for creating collation instances that perform
 //! string comparisons according to specified collation rules.
 //!
+//! ## Implementation
+//!
+//! Uses raw ICU 4C 75.1 FFI bindings (not rust_icu) for full control over ICU version and linking.
+//! ICU is statically linked, eliminating runtime library dependencies.
+//!
 //! ## Caching
 //!
 //! Like Spark's CollationFactory which caches collation instances in a ConcurrentHashMap,
@@ -11,55 +16,42 @@
 //! - Cache key: lowercased collation name (e.g., "unicode", "en_us_ci")
 //! - Case-insensitive: "UNICODE" and "unicode" map to the same entry
 //! - Provider and version NOT included in cache key
-//! - UCollator instances are wrapped in `Arc<Mutex<ThreadSafeCollator>>` for thread-safe access
-//! - ICU collators are locked during comparison operations (similar to synchronized access in Java)
+//! - ICU collators are wrapped in `Arc<Mutex<>>` for thread-safe access
+//! - Collators are locked during comparison operations (similar to synchronized access in Java)
 
 use crate::collation::{CollationIdentifier, CollationProvider};
+use crate::icu_ffi;
 use crate::DeltaResult;
-use rust_icu_ucol::UCollator;
-use rust_icu_sys::{versioned_function, UChar32};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 /// ICU version string in "major.minor" format (e.g., "75.1").
 /// This is computed at runtime from the actual ICU library being used.
-pub static ICU_VERSION: LazyLock<String> = LazyLock::new(|| {
-    let mut version_array: [u8; 4] = [0; 4];
-    unsafe {
-        versioned_function!(u_getVersion)(version_array.as_mut_ptr());
-    }
-    format!("{}.{}", version_array[0], version_array[1])
+/// Like Java's ICU_VERSION from VersionInfo.ICU_VERSION.
+pub static ICU_VERSION: LazyLock<String> = LazyLock::new(|| icu_ffi::get_icu_version());
+
+/// Set of available ICU locale names in lowercase.
+/// Built from ICU's available locales, similar to Spark's ICULocaleMapUppercase.
+/// Used to validate that a locale name is actually supported by ICU.
+static AVAILABLE_ICU_LOCALES: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    let locales = icu_ffi::get_available_locales();
+    locales.into_iter().map(|s| s.to_lowercase()).collect()
 });
-
-/// Thread-safe wrapper for UCollator.
-///
-/// ICU collators are safe to use from multiple threads when properly synchronized.
-/// Like Spark/Java's CollatorICU (which uses synchronized methods or frozen collators),
-/// we wrap UCollator in this struct and protect access with a Mutex.
-///
-/// SAFETY: UCollator contains a raw pointer to ICU's C API UCollator.
-/// ICU collators are thread-safe for read-only operations (compare, equals) when:
-/// 1. Access is synchronized (we use Mutex for this)
-/// 2. The collator is not being modified concurrently (we only do read operations)
-///
-struct ThreadSafeCollator(UCollator);
-
-// SAFETY: We guarantee thread-safety through Mutex synchronization in Collation.
-// The Mutex ensures only one thread accesses the UCollator at a time.
-unsafe impl Send for ThreadSafeCollator {}
-unsafe impl Sync for ThreadSafeCollator {}
 
 /// A collation instance that provides string comparison functionality.
 ///
 /// This struct encapsulates all the information and functions needed to perform
 /// collation-aware string operations.
+///
+/// ICU collators are wrapped in Arc<Mutex<>> for thread-safe shared access,
+/// similar to Spark/Java's CollatorICU which uses synchronized methods.
 pub struct Collation {
     /// The collation identifier
     pub identifier: CollationIdentifier,
 
     /// ICU collator instance wrapped in Arc<Mutex<>> for thread-safe access
     /// Only present for ICU collations, None for Spark collations
-    collator: Option<Arc<Mutex<ThreadSafeCollator>>>,
+    collator: Option<Arc<Mutex<icu_ffi::Collator>>>,
 }
 
 impl Collation {
@@ -91,11 +83,10 @@ impl Collation {
                 if let Some(ref collator_arc) = self.collator {
                     // Lock the collator for thread-safe access
                     let collator = collator_arc.lock().unwrap();
-                    // Access the inner UCollator through the wrapper
-                    // Use strcoll_utf8 which works directly with &str
-                    collator.0.strcoll_utf8(s1, s2).map_err(|e| {
+                    // Use compare_utf8 which works directly with &str
+                    collator.compare_utf8(s1, s2).map_err(|e| {
                         crate::Error::generic(format!(
-                            "ICU collation comparison failed: {:?}",
+                            "ICU collation comparison failed: {}",
                             e
                         ))
                     })
@@ -183,12 +174,8 @@ impl Collation {
                 // ς → σ (context-unaware mapping)
                 result.push(GREEK_SMALL_SIGMA);
             } else {
-                // Use ICU's u_tolower for all other characters
-                let lower = unsafe { versioned_function!(u_tolower)(codepoint as UChar32) };
-                // ICU should always return valid Unicode codepoints
-                // If this fails, it indicates a serious error that must be surfaced
-                let lower_char = char::from_u32(lower as u32)
-                    .expect("ICU u_tolower returned invalid Unicode codepoint");
+                // Use ICU's to_lower for all other characters
+                let lower_char = icu_ffi::to_lower(ch);
                 result.push(lower_char);
             }
         }
@@ -250,6 +237,14 @@ impl ParsedLocale {
         let (case_sensitive, accent_sensitive) = Self::parse_sensitivity_modifiers(name)?;
         let base = Self::strip_sensitivity_modifiers(name);
 
+        // Check for leading/trailing underscores
+        if base.starts_with('_') || base.ends_with('_') {
+            return Err(crate::Error::unsupported(format!(
+                "Invalid locale '{}': locale cannot start or end with underscore",
+                name
+            )));
+        }
+
         // Check for empty components (double underscores)
         if base.contains("__") {
             return Err(crate::Error::unsupported(format!(
@@ -260,6 +255,14 @@ impl ParsedLocale {
 
         // Split by underscore to get locale components
         let parts: Vec<&str> = base.split('_').collect();
+
+        // Check max components (language_Script_Country = max 3)
+        if parts.len() > 3 {
+            return Err(crate::Error::unsupported(format!(
+                "Invalid locale '{}': too many components (expected language[_Script][_Country])",
+                name
+            )));
+        }
 
         // Parse components based on count
         match parts.len() {
@@ -451,53 +454,60 @@ impl ParsedLocale {
         parts.join("_")
     }
 
-    /// Validates that the locale components are available in ICU.
+    /// Validates that the locale is available in ICU.
+    ///
+    /// Like Spark's CollationFactory.collationNameToId(), we search for the longest
+    /// valid locale prefix. If the longest match is not the full locale name,
+    /// it means there are invalid components in the locale string.
     fn validate_availability(&self, original_name: &str) -> DeltaResult<()> {
-        use rust_icu_ucol::get_available_locales;
-
         // Special case: "unicode" (root collation) is always valid
         if self.language.eq_ignore_ascii_case("unicode") {
             return Ok(());
         }
 
-        // Get available locales from ICU
-        let available = get_available_locales().map_err(|e| {
-            crate::Error::generic(format!("Failed to get available ICU locales: {:?}", e))
-        })?;
-
-        // Build the locale string for validation
-        // ICU uses '-' not '_', so convert
+        // Build the locale string in Spark format (with 3-letter country codes)
         let base_locale = self.base_locale();
-        let icu_format = base_locale.replace('_', "-");
+        let base_lowercase = base_locale.to_lowercase();
 
-        // Check if the locale (or a parent) is available
-        for locale_result in available {
-            if let Ok(locale) = locale_result {
-                // Exact match
-                if locale.eq_ignore_ascii_case(&icu_format) {
-                    return Ok(());
-                }
-                // Check if this is a parent locale (e.g., "en" matches for "en-US")
-                if icu_format.eq_ignore_ascii_case(&locale)
-                    || icu_format.to_lowercase().starts_with(&format!("{}-", locale.to_lowercase()))
-                {
-                    return Ok(());
-                }
+        // Search for the longest locale match (Spark's algorithm)
+        let mut last_valid_pos = None;
+        for i in 1..=base_lowercase.len() {
+            let prefix = &base_lowercase[..i];
+            if AVAILABLE_ICU_LOCALES.contains(prefix) {
+                last_valid_pos = Some(i);
             }
         }
 
-        Err(crate::Error::unsupported(format!(
-            "Collation '{}' is not available in ICU. The locale '{}' is not supported.",
-            original_name, base_locale
-        )))
+        match last_valid_pos {
+            Some(pos) if pos == base_lowercase.len() => {
+                // The entire locale name is valid
+                Ok(())
+            }
+            Some(pos) => {
+                // Found a valid prefix but there's extra invalid stuff after it
+                let valid_part = &base_locale[..pos];
+                let invalid_part = &base_locale[pos..];
+                Err(crate::Error::unsupported(format!(
+                    "Invalid locale '{}': '{}' is valid but '{}' is not a valid component",
+                    original_name, valid_part, invalid_part
+                )))
+            }
+            None => {
+                // No valid locale prefix found at all
+                Err(crate::Error::unsupported(format!(
+                    "Collation '{}' is not available in ICU. The locale '{}' is not supported.",
+                    original_name, base_locale
+                )))
+            }
+        }
     }
 }
 
 /// Thread-safe cache for collation instances.
+///
 /// Collations are expensive to create (especially ICU collators), so we cache them by name.
-/// Thread-safe cache for Collation instances.
-/// Cache key: normalized collation name (String) - provider and version are NOT included.
-/// UCollator instances are wrapped in Arc<Mutex<>> for thread-safe shared access.
+/// Cache key: lowercased collation name - provider and version are NOT included.
+/// ICU collators are wrapped in Arc<Mutex<>> for thread-safe shared access.
 static COLLATION_CACHE: LazyLock<RwLock<HashMap<String, Arc<Collation>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -606,17 +616,17 @@ impl CollationFactory {
         // Convert Spark format to ICU format and create collator
         let icu_locale = identifier.to_icu_locale_string();
 
-        // Create ICU collator and wrap in ThreadSafeCollator + Arc<Mutex<>> for thread-safe access
-        let collator = UCollator::try_from(icu_locale.as_str()).map_err(|e| {
+        // Create ICU collator and wrap in Arc<Mutex<>> for thread-safe access
+        let collator = icu_ffi::Collator::try_new(&icu_locale).map_err(|e| {
             crate::Error::unsupported(format!(
-                "Failed to create ICU collator for '{}': {:?}",
+                "Failed to create ICU collator for '{}': {}",
                 identifier.name, e
             ))
         })?;
 
         Ok(Collation {
             identifier,
-            collator: Some(Arc::new(Mutex::new(ThreadSafeCollator(collator)))),
+            collator: Some(Arc::new(Mutex::new(collator))),
         })
     }
 }
@@ -753,7 +763,7 @@ mod tests {
         // Test that ICU collator errors are properly propagated, not silently converted to Equal
         // This ensures we don't hide ICU errors
         // Use 3-letter country code (Spark format)
-        let identifier = CollationIdentifier::icu("en_GBR_CI", None);
+        let identifier = CollationIdentifier::icu("en_USA_CI", None);
         let collation = CollationFactory::from_identifier(identifier).unwrap();
 
         // Normal comparisons should work
@@ -779,6 +789,89 @@ mod tests {
                 );
             }
             Ok(_) => panic!("Expected en_US_CI to be rejected, but it was accepted"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_icu_locale_rejected() {
+        // Test that invalid ICU locales are properly rejected by our validation
+        // Based on Spark's invalid collation name tests
+        let invalid_locales = vec![
+            // Invalid language codes (wrong length or format)
+            ("xyz", "non-existent language code"),
+            ("enn", "invalid 3-letter language code"),
+            ("zzz_USA", "non-existent language with valid country"),
+            ("abcd_USA", "invalid language code length"),
+
+            // Invalid script codes (wrong format or case)
+            ("en_Abcd_USA", "invalid script code format (not title case)"),
+            ("en_Xyz_USA", "non-existent script code"),
+            ("en_AB_USA", "script code too short"),
+            ("en_LATN_USA", "script code all uppercase"),
+            ("en_latn_USA", "script code all lowercase"),
+            ("en_Latn_USA", "Latin script not valid for English locale"),
+            ("en_Cyrl_USA", "Cyrillic script not valid for English locale"),
+
+            // Invalid country codes (not available in ICU)
+            ("en_XYZ", "non-existent country code"),
+            ("en_GBR", "country code not available in ICU"),
+            ("en_AAA", "invalid 3-letter country code"),
+            ("en_ABCD", "country code too long"),
+            ("en_999", "numeric country code"),
+
+            // Invalid components
+            ("en_Something", "invalid component 'Something'"),
+            ("en_Something_USA", "invalid script code 'Something'"),
+            ("en_USA_AAA", "invalid component after country"),
+            ("sr_Cyrl_SRB_AAA", "invalid component after full locale"),
+
+            // Invalid ordering of components (language, script, country)
+            ("USA_en", "country code before language"),
+            ("sr_SRB_Cyrl", "country code before script"),
+            ("SRB_sr", "country code before language"),
+            ("SRB_sr_Cyrl", "country code before language and script"),
+            ("SRB_Cyrl_sr", "wrong ordering of all components"),
+            ("Cyrl_sr", "script code before language"),
+            ("Cyrl_sr_SRB", "script code before language"),
+            ("Cyrl_SRB_sr", "wrong ordering of all components"),
+
+            // Collation specifiers in wrong place (must be at end)
+            ("en_CI_USA", "CI modifier before country"),
+            ("sr_CI_Cyrl_SRB", "CI modifier before script"),
+            ("sr_Cyrl_CI_SRB", "CI modifier between script and country"),
+            ("CI_en", "CI modifier before language"),
+            ("USA_CI_en", "CI modifier in middle"),
+
+            // Malformed strings
+            ("en__USA", "double underscore"),
+            ("en_USA_USA_USA", "too many components"),
+            ("_en_USA", "leading underscore"),
+            ("en_USA_", "trailing underscore"),
+            ("_CI_AI", "no locale specified, starts with modifier"),
+        ];
+
+        for (locale, description) in invalid_locales {
+            let identifier = CollationIdentifier::icu(locale, None);
+            let result = CollationFactory::from_identifier(identifier);
+
+            match result {
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    // Verify error mentions either the locale name or validation failure
+                    assert!(
+                        err_msg.contains(locale) || err_msg.contains("Invalid locale") || err_msg.contains("must be"),
+                        "Error for '{}' ({}) should mention the locale or validation error. Got: {}",
+                        locale,
+                        description,
+                        err_msg
+                    );
+                }
+                Ok(_) => panic!(
+                    "Expected invalid locale '{}' ({}) to be rejected, but it was accepted",
+                    locale,
+                    description
+                ),
+            }
         }
     }
 
@@ -953,18 +1046,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: This test requires rust_icu_sys to be built with ICU 75.1
-              // Currently fails due to Cargo build script environment isolation
-              // Run with: cargo test --features default-engine-rustls -- --ignored
     fn test_icu_version() {
         // This test ensures we're using ICU 75.1 as required
-        // To make this pass, you need to ensure rust_icu_sys is built with ICU 75.1:
-        //   1. Clean cargo cache for rust_icu: cargo clean -p rust_icu_sys
-        //   2. Set env vars BEFORE running cargo:
-        //      export PKG_CONFIG_PATH="$PWD/.icu/icu-75.1/lib/pkgconfig"
-        //      export LD_LIBRARY_PATH="$PWD/.icu/icu-75.1/lib"
-        //   3. Run: cargo test --features default-engine-rustls -- --ignored test_icu_version
-
+        // The ICU version is detected from the actual library we link against via FFI
         eprintln!("ICU_VERSION runtime value: {}", ICU_VERSION.as_str());
         eprintln!("Expected: 75.1");
 

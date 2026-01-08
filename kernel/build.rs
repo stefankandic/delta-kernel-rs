@@ -10,5 +10,6 @@ fn main() {
         println!("cargo:rustc-cfg=NIGHTLY_CHANNEL");
     }
 
-    icu_build::setup();
+    // Setup ICU: download, build, generate bindings, and configure linking
+    icu_build::setup_icu();
 }

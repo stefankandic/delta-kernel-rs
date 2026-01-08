@@ -87,6 +87,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+mod icu_ffi;
 pub mod collation;
 pub mod collation_factory;
 pub mod committer;

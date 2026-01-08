@@ -490,11 +490,11 @@ mod tests {
 
     #[test]
     fn test_icu_version_available() {
-        use rust_icu_ucol::UCollator;
+        use crate::icu_ffi;
 
         // Verify we can create a collator (which means ICU is working)
         // The actual version is checked by build.rs
-        let collator = UCollator::try_from("en_US");
+        let collator = icu_ffi::Collator::try_new("en_US");
         assert!(collator.is_ok(), "ICU collator should be available");
 
         // Note: ICU 75.1 is required by build.rs for the default engine.
@@ -503,16 +503,16 @@ mod tests {
 
     #[test]
     fn test_icu_collator_creation() {
-        use rust_icu_ucol::UCollator;
+        use crate::icu_ffi;
 
         // Test creating collators for different locales
-        let collator = UCollator::try_from("en_US");
+        let collator = icu_ffi::Collator::try_new("en_US");
         assert!(collator.is_ok(), "Failed to create en_US collator");
 
-        let collator = UCollator::try_from("de_DE");
+        let collator = icu_ffi::Collator::try_new("de_DE");
         assert!(collator.is_ok(), "Failed to create de_DE collator");
 
-        let collator = UCollator::try_from("ja_JP");
+        let collator = icu_ffi::Collator::try_new("ja_JP");
         assert!(collator.is_ok(), "Failed to create ja_JP collator");
     }
 
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_icu_builder_creates_valid_collator() {
-        use rust_icu_ucol::UCollator;
+        use crate::icu_ffi;
 
         // Test that the builder creates valid Spark format that converts to ICU
         let collation = CollationIdentifier::icu_builder("en_US")
@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(icu_locale, "en_US@colStrength=secondary");
 
         // This should successfully create a collator
-        let collator = UCollator::try_from(icu_locale.as_str());
+        let collator = icu_ffi::Collator::try_new(&icu_locale);
         assert!(collator.is_ok(), "Converted ICU locale string should be valid");
     }
 
@@ -681,38 +681,38 @@ mod tests {
 
     #[test]
     fn test_spark_databricks_locale_formats() {
-        use rust_icu_ucol::UCollator;
+        use crate::icu_ffi;
 
         // Test Spark/Databricks locale format compatibility
 
         // Language only
         let collation = CollationIdentifier::icu_builder("en").build();
-        assert!(UCollator::try_from(collation.name.as_str()).is_ok());
+        assert!(icu_ffi::Collator::try_new(&collation.name).is_ok());
 
         // Language + 2-letter country
         let collation = CollationIdentifier::icu_builder("en_US").build();
-        assert!(UCollator::try_from(collation.name.as_str()).is_ok());
+        assert!(icu_ffi::Collator::try_new(&collation.name).is_ok());
 
         // Language + 3-letter country (Spark/Databricks format)
         let collation = CollationIdentifier::icu_builder("fr_CAN").build();
-        assert!(UCollator::try_from(collation.name.as_str()).is_ok());
+        assert!(icu_ffi::Collator::try_new(&collation.name).is_ok());
 
         // Language + Script + Country (3-letter)
         let collation = CollationIdentifier::icu_builder("zh_Hant_MAC").build();
-        assert!(UCollator::try_from(collation.name.as_str()).is_ok());
+        assert!(icu_ffi::Collator::try_new(&collation.name).is_ok());
 
         // Language + Script + Country (2-letter)
         let collation = CollationIdentifier::icu_builder("sr_Cyrl_RS").build();
-        assert!(UCollator::try_from(collation.name.as_str()).is_ok());
+        assert!(icu_ffi::Collator::try_new(&collation.name).is_ok());
 
         // Root/undefined collation
         let collation = CollationIdentifier::icu_builder("und").build();
-        assert!(UCollator::try_from(collation.name.as_str()).is_ok());
+        assert!(icu_ffi::Collator::try_new(&collation.name).is_ok());
     }
 
     #[test]
     fn test_locale_case_insensitivity() {
-        use rust_icu_ucol::UCollator;
+        use crate::icu_ffi;
 
         // Locale identifiers should be case-insensitive
         // ICU normalizes these internally
@@ -720,9 +720,9 @@ mod tests {
         let lower = CollationIdentifier::icu_builder("en_us").build();
         let mixed = CollationIdentifier::icu_builder("en_US").build();
 
-        assert!(UCollator::try_from(upper.name.as_str()).is_ok());
-        assert!(UCollator::try_from(lower.name.as_str()).is_ok());
-        assert!(UCollator::try_from(mixed.name.as_str()).is_ok());
+        assert!(icu_ffi::Collator::try_new(&upper.name).is_ok());
+        assert!(icu_ffi::Collator::try_new(&lower.name).is_ok());
+        assert!(icu_ffi::Collator::try_new(&mixed.name).is_ok());
     }
 
     #[test]
