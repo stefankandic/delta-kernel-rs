@@ -77,6 +77,13 @@ pub enum BinaryExpressionOp {
 pub enum VariadicExpressionOp {
     /// Collapse multiple values into one by taking the first non-null value
     Coalesce,
+    /// Access an element in a map by key: element_at(map, key)
+    /// Takes exactly 2 arguments: the map expression and the key expression
+    ElementAt,
+    /// Access a field in a struct: struct_field(struct_expr, field_path)
+    /// Takes 2+ arguments: the struct expression and one or more field names as string literals
+    /// for nested access
+    StructField,
 }
 
 /// A junction (AND/OR) predicate operator.
@@ -555,6 +562,7 @@ impl BinaryExpression {
 }
 
 impl BinaryPredicate {
+    #[allow(dead_code)]
     fn new(
         op: BinaryPredicateOp,
         left: impl Into<Expression>,
@@ -576,6 +584,22 @@ impl BinaryPredicate {
     /// This is equivalent to `with_context(ExprContext::with_collation(collation))`.
     pub fn with_collation(self, collation: crate::collation::CollationIdentifier) -> Self {
         self.with_context(ExprContext::with_collation(collation))
+    }
+
+    /// Creates a copy of this predicate with new left and right expressions, preserving
+    /// the operator and context.
+    /// ```
+    pub fn with_expressions(
+        &self,
+        left: impl Into<Expression>,
+        right: impl Into<Expression>,
+    ) -> Self {
+        Self {
+            op: self.op,
+            left: Box::new(left.into()),
+            right: Box::new(right.into()),
+            context: self.context.clone(),
+        }
     }
 }
 
@@ -637,6 +661,26 @@ impl Expression {
     /// Create a new transform expression
     pub fn transform(transform: Transform) -> Self {
         Self::Transform(transform)
+    }
+
+    /// Create a new element_at expression to access a map element by key
+    /// Example: element_at(map_col, "key") returns map_col["key"]
+    pub fn element_at(map: impl Into<Self>, key: impl Into<Self>) -> Self {
+        Self::Variadic(VariadicExpression::new(
+            VariadicExpressionOp::ElementAt,
+            [map.into(), key.into()],
+        ))
+    }
+
+    /// Create a new struct_field expression to access a field in a struct
+    /// Example: struct_field(struct_expr, "field1", "field2") returns struct_expr.field1.field2
+    pub fn struct_field(struct_expr: impl Into<Self>, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let mut exprs = vec![struct_expr.into()];
+        exprs.extend(fields.into_iter().map(|f| Self::literal(f.into())));
+        Self::Variadic(VariadicExpression::new(
+            VariadicExpressionOp::StructField,
+            exprs,
+        ))
     }
 
     /// Create a new predicate `self IS NULL`
@@ -907,6 +951,93 @@ impl Predicate {
         self.with_context(ExprContext::with_collation(collation))
     }
 
+    /// Checks if this predicate should be removed for parquet row group filtering.
+    ///
+    /// Currently removes predicates with non-binary collations since parquet stats
+    /// use binary comparison.
+    ///
+    /// This is a private helper to make the removal logic extensible for future cases.
+    fn should_remove_for_parquet_filter(&self) -> bool {
+        match self {
+            Self::Binary(bp) => {
+                // Remove if this binary predicate has a non-binary collation
+                if let Some(ref collation) = bp.context.as_ref().and_then(|ctx| ctx.collation.as_ref()) {
+                    !collation.is_spark_utf8_binary()
+                } else {
+                    false
+                }
+            }
+            _ => false, // Only binary predicates can have collations that need removal
+        }
+    }
+
+    /// Transforms this predicate for parquet row group filtering by removing parts that
+    /// cannot be safely evaluated using parquet stats.
+    ///
+    /// Returns `None` if the entire predicate cannot be used for parquet filtering.
+    ///
+    /// # Strategy
+    /// - Predicates that should be removed (see `should_remove_for_parquet_filter`) return `None`
+    /// - AND: Remove problematic parts, keep remaining predicates (conservative filtering)
+    /// - OR: If any part should be removed, return `None` (can't safely filter)
+    /// - NOT: If inner should be removed, return `None`
+    ///
+    /// # Examples
+    /// - `x > 5 AND y = 'b'` (collation on y) → `Some(x > 5)`
+    /// - `x > 5 OR y = 'b'` (collation on y) → `None` (must keep all row groups)
+    /// - `y = 'b'` (collation on y) → `None`
+    pub fn for_parquet_row_group_filter(&self) -> Option<Self> {
+        // Check if this predicate should be removed
+        if self.should_remove_for_parquet_filter() {
+            return None;
+        }
+
+        match self {
+            Self::Junction(jp) => {
+                match jp.op {
+                    JunctionPredicateOp::And => {
+                        // For AND: Keep predicates that pass the filter
+                        let filtered: Vec<_> = jp.preds.iter()
+                            .filter_map(|p| p.for_parquet_row_group_filter())
+                            .collect();
+
+                        match filtered.len() {
+                            0 => None, // All predicates were removed
+                            1 => Some(filtered.into_iter().next().unwrap()),
+                            _ => Some(Self::Junction(JunctionPredicate {
+                                op: JunctionPredicateOp::And,
+                                preds: filtered,
+                            })),
+                        }
+                    }
+                    JunctionPredicateOp::Or => {
+                        // For OR: If any part should be removed, we can't safely filter
+                        let transformed: Vec<_> = jp.preds.iter()
+                            .map(|p| p.for_parquet_row_group_filter())
+                            .collect();
+
+                        if transformed.iter().any(|p| p.is_none()) {
+                            // At least one predicate should be removed - can't filter
+                            None
+                        } else {
+                            // All predicates are safe
+                            Some(Self::Junction(JunctionPredicate {
+                                op: JunctionPredicateOp::Or,
+                                preds: transformed.into_iter().map(|p| p.unwrap()).collect(),
+                            }))
+                        }
+                    }
+                }
+            }
+            Self::Not(pred) => {
+                // For NOT: If inner should be removed, we can't filter
+                pred.for_parquet_row_group_filter().map(|p| Self::Not(Box::new(p)))
+            }
+            // All other predicate types that passed should_remove_for_parquet_filter are safe
+            _ => Some(self.clone()),
+        }
+    }
+
     /// Create a new predicate `a == b` with the specified collation.
     pub fn eq_collated(
         a: impl Into<Expression>,
@@ -1069,6 +1200,8 @@ impl Display for VariadicExpressionOp {
         use VariadicExpressionOp::*;
         match self {
             Coalesce => write!(f, "COALESCE"),
+            ElementAt => write!(f, "ELEMENT_AT"),
+            StructField => write!(f, "STRUCT_FIELD"),
         }
     }
 }
@@ -1316,5 +1449,72 @@ mod tests {
             let result = format!("{pred}");
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn test_parquet_filter_transform_and() {
+        use crate::collation::CollationIdentifier;
+        use crate::expressions::Scalar;
+
+        // Test: x > 5 AND y = 'b' (collation on y) → Should keep x > 5
+        let x_gt_5 = Pred::gt(column_expr!("x"), Scalar::from(5));
+        let y_eq_b = Pred::eq(column_expr!("y"), Scalar::from("b"))
+            .with_collation(CollationIdentifier::spark("UTF8_LCASE"));
+
+        let pred = Pred::and(x_gt_5.clone(), y_eq_b);
+
+        let filtered = pred.for_parquet_row_group_filter();
+        assert!(filtered.is_some(), "AND with collation should filter non-collated parts");
+
+        // Should only contain x > 5
+        let filtered = filtered.unwrap();
+
+        // Verify it's the x > 5 predicate (or similar structure)
+        match filtered {
+            Pred::Binary(bp) => {
+                assert_eq!(bp.op, super::BinaryPredicateOp::GreaterThan);
+            }
+            _ => panic!("Expected binary predicate, got: {filtered:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parquet_filter_transform_or() {
+        use crate::collation::CollationIdentifier;
+        use crate::expressions::Scalar;
+
+        // Test: x > 5 OR y = 'b' (collation on y) → Should return None (can't filter)
+        let x_gt_5 = Pred::gt(column_expr!("x"), Scalar::from(5));
+        let y_eq_b = Pred::eq(column_expr!("y"), Scalar::from("b"))
+            .with_collation(CollationIdentifier::spark("UTF8_LCASE"));
+
+        let pred = Pred::or(x_gt_5, y_eq_b);
+
+        let filtered = pred.for_parquet_row_group_filter();
+        assert!(filtered.is_none(), "OR with collation should return None");
+    }
+
+    #[test]
+    fn test_parquet_filter_transform_binary_only() {
+        use crate::expressions::Scalar;
+
+        // Test: Pure UTF8_BINARY predicate should pass through unchanged
+        let pred = Pred::eq(column_expr!("x"), Scalar::from("test"));
+
+        let filtered = pred.for_parquet_row_group_filter();
+        assert!(filtered.is_some(), "Binary predicate should pass through");
+    }
+
+    #[test]
+    fn test_parquet_filter_transform_collated_only() {
+        use crate::collation::CollationIdentifier;
+        use crate::expressions::Scalar;
+
+        // Test: Pure collated predicate should return None
+        let pred = Pred::eq(column_expr!("x"), Scalar::from("test"))
+            .with_collation(CollationIdentifier::spark("UTF8_LCASE"));
+
+        let filtered = pred.for_parquet_row_group_filter();
+        assert!(filtered.is_none(), "Collated predicate should return None");
     }
 }

@@ -15,7 +15,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
+use crate::schema::{DataType, MapType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{
     Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
 };
@@ -41,13 +41,13 @@ mod tests;
 ///   predicate is dropped.
 #[cfg(test)]
 pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
-    DataSkippingPredicateCreator.eval(pred)
+    DataSkippingPredicateCreator::default().eval(pred)
 }
 
 /// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`]
 /// instead of [`KernelPredicateEvaluator::eval`].
 fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
-    DataSkippingPredicateCreator.eval_sql_where(pred)
+    DataSkippingPredicateCreator::default().eval_sql_where(pred)
 }
 
 pub(crate) struct DataSkippingFilter {
@@ -116,11 +116,23 @@ impl DataSkippingFilter {
         let nullcount_schema = NullCountStatsTransform
             .transform_struct(&stats_schema)?
             .into_owned();
+
+        let stats_with_collation = DataType::Map(Box::new(MapType::new(
+            DataType::STRING, // key: "icu.UNICODE.75.1"
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("minValues", stats_schema.clone()),
+                StructField::nullable("maxValues", stats_schema.clone()),
+            ]))),
+            true, // value contains nulls
+        )));
+
+
         let stats_schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", nullcount_schema),
             StructField::nullable("minValues", stats_schema.clone()),
             StructField::nullable("maxValues", stats_schema),
+            StructField::nullable("statsWithCollation", stats_with_collation),
         ]));
 
         // Skipping happens in several steps:
@@ -207,15 +219,80 @@ impl DataSkippingFilter {
     }
 }
 
-struct DataSkippingPredicateCreator;
+struct DataSkippingPredicateCreator {
+    /// Current expression context for the predicate being evaluated.
+    /// Used to determine if collation-aware stats should be used.
+    current_context: std::cell::RefCell<Option<crate::expressions::ExprContext>>,
+}
+
+impl Default for DataSkippingPredicateCreator {
+    fn default() -> Self {
+        Self {
+            current_context: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+/// Type of statistics to retrieve (min or max values).
+enum StatType {
+    Min,
+    Max,
+}
+
+impl DataSkippingPredicateCreator {
+    /// Helper to get stats for string columns, handling collation if present.
+    ///
+    /// Returns:
+    /// - `Some(expr)`: Use this stat expression (collation-aware or default)
+    /// - `None`: Collation version mismatch, drop the predicate
+    fn get_string_stat(&self, col: &ColumnName, stat_type: StatType) -> Option<Expr> {
+        let context = self.current_context.borrow();
+
+        if let Some(ref ctx) = *context {
+            if let Some(ref collation) = ctx.collation {
+                // Check version compatibility first (data skipping only)
+                if !collation.is_version_compatible() {
+                    // Version mismatch - drop this predicate for data skipping
+                    return None;
+                }
+
+                if collation.requires_stats_with_collation() {
+                    let stats_key = collation.to_stats_key().ok()?;
+                    // Use element_at to access the map: statsWithCollation[stats_key]
+                    let map_element = Expr::element_at(
+                        Expr::column(["statsWithCollation"]),
+                        Expr::literal(stats_key),
+                    );
+                    // Then access minValues.col or maxValues.col within the struct
+                    let stat_field = match stat_type {
+                        StatType::Min => "minValues",
+                        StatType::Max => "maxValues",
+                    };
+                    let mut fields = vec![stat_field.to_string()];
+                    fields.extend(col.as_ref().iter().cloned());
+                    return Some(Expr::struct_field(map_element, fields));
+                }
+            }
+        }
+
+        // Default: UTF8_BINARY or no collation context
+        match stat_type {
+            StatType::Min => Some(joined_column_expr!("minValues", col)),
+            StatType::Max => Some(joined_column_expr!("maxValues", col)),
+        }
+    }
+}
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     type Output = Pred;
     type ColumnStat = Expr;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
-    fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
-        Some(joined_column_expr!("minValues", col))
+    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        match data_type {
+            &DataType::STRING => self.get_string_stat(col, StatType::Min),
+            _ => Some(joined_column_expr!("minValues", col)),
+        }
     }
 
     /// Retrieves the maximum value of a column, if it exists and has the requested type.
@@ -224,6 +301,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         match data_type {
             &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
+            &DataType::STRING => self.get_string_stat(col, StatType::Max),
             _ => Some(joined_column_expr!("maxValues", col)),
         }
     }
@@ -253,7 +331,15 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             (Ordering::Greater, false) => Pred::gt,
             (Ordering::Greater, true) => Pred::le,
         };
-        Some(pred_fn(col, val.clone()))
+
+        let predicate = pred_fn(col, val.clone());
+
+        // Attach collation if present
+        let context = self.current_context.borrow();
+        Some(match context.as_ref().and_then(|ctx| ctx.collation.as_ref()) {
+            Some(collation) => predicate.with_collation(collation.clone()),
+            None => predicate,
+        })
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
@@ -284,6 +370,76 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     ) -> Option<Pred> {
         KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, context, inverted)
             .map(Pred::literal)
+    }
+
+    /// Override to capture context for collation-aware stats routing.
+    /// This enables get_min_stat/get_max_stat to use statsWithCollation for non-binary collations.
+    fn eval_pred_lt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Pred> {
+        // Store context for get_min_stat/get_max_stat to use
+        *self.current_context.borrow_mut() = context.cloned();
+
+        // Call the default implementation (from DataSkippingPredicateEvaluator trait)
+        // which will now use our updated get_min_stat/get_max_stat
+        if inverted {
+            self.partial_cmp_max_stat(col, val, Ordering::Less, true)
+        } else {
+            self.partial_cmp_min_stat(col, val, Ordering::Less, false)
+        }
+    }
+
+    /// Override to capture context for collation-aware stats routing.
+    fn eval_pred_gt(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Pred> {
+        // Store context for get_min_stat/get_max_stat to use
+        *self.current_context.borrow_mut() = context.cloned();
+
+        // Call the default implementation (from DataSkippingPredicateEvaluator trait)
+        if inverted {
+            self.partial_cmp_min_stat(col, val, Ordering::Greater, true)
+        } else {
+            self.partial_cmp_max_stat(col, val, Ordering::Greater, false)
+        }
+    }
+
+    /// Override to capture context for collation-aware stats routing.
+    fn eval_pred_eq(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        context: Option<&crate::expressions::ExprContext>,
+        inverted: bool,
+    ) -> Option<Pred> {
+        // Store context for get_min_stat/get_max_stat to use
+        *self.current_context.borrow_mut() = context.cloned();
+
+        // Use the same logic as the default implementation
+        let (op, preds) = if inverted {
+            // Column could compare not-equal if min or max value differs from the literal.
+            let preds = [
+                self.partial_cmp_min_stat(col, val, Ordering::Equal, true),
+                self.partial_cmp_max_stat(col, val, Ordering::Equal, true),
+            ];
+            (JunctionPredicateOp::Or, preds)
+        } else {
+            // Column could compare equal if its min/max values bracket the literal.
+            let preds = [
+                self.partial_cmp_min_stat(col, val, Ordering::Greater, true),
+                self.partial_cmp_max_stat(col, val, Ordering::Less, true),
+            ];
+            (JunctionPredicateOp::And, preds)
+        };
+        DataSkippingPredicateEvaluator::finish_eval_pred_junction(self, op, &mut preds.into_iter(), false)
     }
 
     fn eval_pred_opaque(

@@ -210,6 +210,10 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Collation version mismatch between predicate and available stats
+    #[error("Collation version mismatch: {0}")]
+    CollationVersionMismatch(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -293,6 +297,10 @@ impl Error {
 
     pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
+    }
+
+    pub fn collation_version_mismatch(msg: impl ToString) -> Self {
+        Self::CollationVersionMismatch(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

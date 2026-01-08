@@ -344,7 +344,7 @@ fn test_sql_where() {
 // are truncated to milliseconds in add.stats.
 #[test]
 fn test_timestamp_skipping_disabled() {
-    let creator = DataSkippingPredicateCreator;
+    let creator = DataSkippingPredicateCreator::default();
     let col = &column_name!("timestamp_col");
 
     assert!(

@@ -10,10 +10,10 @@
 //! - Format: `language[_Script][_Country]`
 //! - Language: 2-letter ISO 639-1 code (e.g., `en`, `fr`, `zh`)
 //! - Script: 4-letter ISO 15924 code (optional, e.g., `Hant`, `Cyrl`)
-//! - Country: 2 or 3-letter ISO 3166 code (e.g., `US`, `CAN`, `MAC`)
-//! - Case insensitive: `en_US`, `EN_US`, `en_us` are equivalent
+//! - Country: 3-letter ISO 3166 code (e.g., `USA`, `CAN`, `MAC`)
+//! - Case insensitive: `en_USA`, `EN_USA`, `en_usa` are equivalent
 //!
-//! Examples: `en`, `en_US`, `fr_CAN`, `zh_Hant_MAC`, `sr_Cyrl_RS`
+//! Examples: `UNICODE`, `en_USA`, `fr_CAN`, `zh_Hant_MAC`, `sr_Cyrl_SRB`
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -76,7 +76,7 @@ pub struct CollationIdentifier {
     ///
     /// Examples:
     /// - Spark: "UTF8_BINARY", "UTF8_LCASE", "UNICODE", "UNICODE_CI"
-    /// - ICU: "en_US", "de_DE", "ja_JP", etc.
+    /// - ICU: "UNICODE", "en_USA", "de_DEU", "ja_JPN", etc.
     pub name: String,
 
     /// Optional version identifier for the collation implementation.
@@ -159,6 +159,62 @@ impl CollationIdentifier {
         }
     }
 
+    /// Creates statsWithCollation lookup key: "icu.UNICODE.75.1" or "spark.UTF8_LCASE.75.1"
+    ///
+    /// For collations with explicit versions, returns the key to look up in statsWithCollation.
+    /// For collations without version (version-agnostic), uses the kernel's ICU version.
+    /// Returns an error if the collation is UTF8_BINARY (which doesn't use statsWithCollation).
+    pub fn to_stats_key(&self) -> crate::DeltaResult<String> {
+        // UTF8_BINARY doesn't use statsWithCollation
+        if self.is_spark_utf8_binary() {
+            let msg = format!(
+                "Collation '{}' does not require statsWithCollation",
+                self
+            );
+            return Err(crate::Error::generic(msg));
+        }
+
+        // Get version: use existing version, or kernel's ICU version if None (version-agnostic)
+        let version = match &self.version {
+            Some(v) => v.clone(),
+            None => {
+                // Version-agnostic: use kernel's ICU version
+                crate::collation_factory::ICU_VERSION.to_string()
+            }
+        };
+
+        Ok(format!("{}.{}.{}", self.provider, self.name, version))
+    }
+
+    /// Returns true if this collation needs statsWithCollation (anything except UTF8_BINARY)
+    /// UTF8_BINARY uses regular minValues/maxValues stats
+    pub fn requires_stats_with_collation(&self) -> bool {
+        !self.is_spark_utf8_binary()
+    }
+
+    /// Returns true if this collation's version is compatible with the kernel's ICU version.
+    ///
+    /// Version compatibility rules:
+    /// - UTF8_BINARY: always compatible (no version)
+    /// - Version specified: must match kernel's ICU version exactly
+    /// - Version None (version-agnostic): always compatible (uses kernel's version)
+    ///
+    /// This is used to determine if stats or comparisons can be safely used with this collation.
+    pub fn is_version_compatible(&self) -> bool {
+        // UTF8_BINARY doesn't need version validation
+        if self.is_spark_utf8_binary() {
+            return true;
+        }
+
+        // If version is specified, it must match the kernel's ICU version
+        if let Some(ref version) = self.version {
+            return version.as_str() == &*crate::collation_factory::ICU_VERSION;
+        }
+
+        // Version-agnostic (None) is always compatible
+        true
+    }
+
 }
 
 impl Display for CollationIdentifier {
@@ -181,11 +237,11 @@ mod tests {
         let collation = CollationIdentifier::spark("UTF8_BINARY");
         assert_eq!(collation.to_string(), "spark.UTF8_BINARY");
 
-        let collation = CollationIdentifier::icu("de_DE".to_string(), Some("75.1".to_string()));
-        assert_eq!(collation.to_string(), "icu.de_DE.75.1");
+        let collation = CollationIdentifier::icu("de_DEU".to_string(), Some("75.1".to_string()));
+        assert_eq!(collation.to_string(), "icu.de_DEU.75.1");
 
-        let collation = CollationIdentifier::icu("en_US".to_string(), None);
-        assert_eq!(collation.to_string(), "icu.en_US");
+        let collation = CollationIdentifier::icu("UNICODE".to_string(), None);
+        assert_eq!(collation.to_string(), "icu.UNICODE");
 
         let collation = CollationIdentifier::custom("custom_provider", "custom_collation");
         assert_eq!(collation.to_string(), "custom_provider.custom_collation");
@@ -306,6 +362,124 @@ mod tests {
 
         // Display format
         assert_eq!(collation.to_string(), "icu.sr_Cyrl_SRB_CI_AI");
+    }
+
+    #[test]
+    fn test_collation_key_format() {
+        use crate::collation_factory::ICU_VERSION;
+
+        // Test ICU collation with explicit version
+        let collation = CollationIdentifier {
+            provider: CollationProvider::Icu,
+            name: "en_US".to_string(),
+            version: Some("75.1".to_string()),
+        };
+        assert_eq!(collation.to_stats_key().unwrap(), "icu.en_US.75.1");
+
+        // Test UTF8_BINARY (should error - doesn't use statsWithCollation)
+        let binary = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_BINARY".to_string(),
+            version: None,
+        };
+        assert!(binary.to_stats_key().is_err());
+
+        // Test UTF8_LCASE without version (should use kernel's ICU version)
+        let lcase = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_LCASE".to_string(),
+            version: None,
+        };
+        let lcase_key = lcase.to_stats_key().unwrap();
+        assert_eq!(lcase_key, format!("spark.UTF8_LCASE.{}", *ICU_VERSION));
+
+        // Test UTF8_LCASE with explicit version
+        let lcase_explicit = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_LCASE".to_string(),
+            version: Some("75.1".to_string()),
+        };
+        assert_eq!(
+            lcase_explicit.to_stats_key().unwrap(),
+            "spark.UTF8_LCASE.75.1"
+        );
+    }
+
+    #[test]
+    fn test_requires_stats_with_collation() {
+        // UTF8_BINARY doesn't require statsWithCollation
+        let binary = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_BINARY".to_string(),
+            version: None,
+        };
+        assert!(!binary.requires_stats_with_collation());
+
+        // ICU collations require statsWithCollation
+        let icu = CollationIdentifier {
+            provider: CollationProvider::Icu,
+            name: "en_US".to_string(),
+            version: Some("75.1".to_string()),
+        };
+        assert!(icu.requires_stats_with_collation());
+
+        // UTF8_LCASE requires statsWithCollation
+        let lcase = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_LCASE".to_string(),
+            version: None,
+        };
+        assert!(lcase.requires_stats_with_collation());
+    }
+
+    #[test]
+    fn test_collation_version_compatibility() {
+        use crate::collation_factory::ICU_VERSION;
+
+        // Matching version should be compatible
+        let matching = CollationIdentifier {
+            provider: CollationProvider::Icu,
+            name: "en_US".to_string(),
+            version: Some(ICU_VERSION.to_string()),
+        };
+        assert!(matching.is_version_compatible());
+
+        // Mismatched version should not be compatible
+        let wrong_version = if *ICU_VERSION == "75.1" {
+            "76.0"
+        } else {
+            "75.1"
+        };
+        let mismatched = CollationIdentifier {
+            provider: CollationProvider::Icu,
+            name: "en_US".to_string(),
+            version: Some(wrong_version.to_string()),
+        };
+        assert!(!mismatched.is_version_compatible());
+
+        // UTF8_BINARY is always compatible
+        let binary = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_BINARY".to_string(),
+            version: None,
+        };
+        assert!(binary.is_version_compatible());
+
+        // UTF8_LCASE without version uses kernel's ICU version (compatible)
+        let lcase = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_LCASE".to_string(),
+            version: None,
+        };
+        assert!(lcase.is_version_compatible());
+
+        // UTF8_LCASE with wrong version is not compatible
+        let lcase_wrong = CollationIdentifier {
+            provider: CollationProvider::Spark,
+            name: "UTF8_LCASE".to_string(),
+            version: Some(wrong_version.to_string()),
+        };
+        assert!(!lcase_wrong.is_version_compatible());
     }
 
 }

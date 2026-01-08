@@ -1,5 +1,6 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -20,6 +21,7 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::collation_factory::CollationFactory;
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
@@ -285,6 +287,43 @@ pub fn evaluate_expression(
                 .try_collect()?;
             Ok(coalesce_arrays(&arrays, result_type)?)
         }
+        (
+            Variadic(VariadicExpression {
+                op: ElementAt,
+                exprs,
+            }),
+            _,
+        ) => {
+            if exprs.len() != 2 {
+                return Err(Error::generic(format!(
+                    "element_at requires exactly 2 arguments (map, key), got {}",
+                    exprs.len()
+                )));
+            }
+            let map_array = evaluate_expression(&exprs[0], batch, None)?;
+            let key_array = evaluate_expression(&exprs[1], batch, None)?;
+            element_at_map(map_array, key_array)
+        }
+        (
+            Variadic(VariadicExpression {
+                op: StructField,
+                exprs,
+            }),
+            _,
+        ) => {
+            if exprs.is_empty() {
+                return Err(Error::generic("struct_field requires at least 1 argument (struct expression)"));
+            }
+            let struct_array = evaluate_expression(&exprs[0], batch, None)?;
+            let field_names: Result<Vec<String>, _> = exprs[1..]
+                .iter()
+                .map(|expr| match expr {
+                    Literal(Scalar::String(s)) => Ok(s.clone()),
+                    _ => Err(Error::generic("struct_field field names must be string literals")),
+                })
+                .collect();
+            access_struct_fields(struct_array, &field_names?)
+        }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
                 .any_ref()
@@ -298,6 +337,106 @@ pub fn evaluate_expression(
         }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
+}
+
+/// Compares two string arrays using collation-aware comparison.
+///
+/// This function performs element-wise string comparison using the provided collation's
+/// `compare()` method instead of binary byte comparison.
+fn compare_strings_with_collation(
+    left: &StringArray,
+    right: &StringArray,
+    collation_identifier: &crate::collation::CollationIdentifier,
+    op: &BinaryPredicateOp,
+    inverted: bool,
+) -> DeltaResult<BooleanArray> {
+    use BinaryPredicateOp::*;
+
+    eprintln!("\n========== COLLATION COMPARISON ==========");
+    eprintln!("[compare_strings_with_collation] Collation: {}", collation_identifier);
+    eprintln!("[compare_strings_with_collation] Operation: {:?}, Inverted: {}", op, inverted);
+    eprintln!("[compare_strings_with_collation] Array length: {}", left.len());
+
+    // Validate version compatibility for partition filtering
+    if !collation_identifier.is_version_compatible() {
+        let version_str = collation_identifier.version.as_ref()
+            .map(|v| v.as_str())
+            .unwrap_or("None");
+        return Err(Error::collation_version_mismatch(format!(
+            "Collation '{}' uses ICU version '{}', but kernel supports version '{}'. \
+             Version mismatch in comparison requires exact match.",
+            collation_identifier, version_str, *crate::collation_factory::ICU_VERSION
+        )));
+    }
+
+    // Get the collation instance
+    let collation = CollationFactory::from_identifier(collation_identifier.clone())?;
+
+    // Ensure both arrays have the same length
+    if left.len() != right.len() {
+        return Err(Error::generic(format!(
+            "String arrays must have same length for comparison: left={}, right={}",
+            left.len(),
+            right.len()
+        )));
+    }
+
+    let len = left.len();
+    let mut result_builder = Vec::with_capacity(len);
+
+    // Compare each pair of strings using the collation
+    for i in 0..len {
+        let result = if left.is_null(i) || right.is_null(i) {
+            eprintln!("[Row {}] NULL value - result: NULL", i);
+            // Null values result in null comparison
+            None
+        } else {
+            let left_str = left.value(i);
+            let right_str = right.value(i);
+
+            eprintln!("[Row {}] Comparing: '{}' vs '{}'", i, left_str, right_str);
+
+            // Call collation.compare() to get ordering
+            let ordering = collation.compare(left_str, right_str)?;
+            eprintln!("[Row {}]   Ordering result: {:?}", i, ordering);
+
+            // Map ordering and operator to boolean result
+            let comparison_result = match (op, ordering) {
+                (LessThan, Ordering::Less) => true,
+                (LessThan, _) => false,
+                (GreaterThan, Ordering::Greater) => true,
+                (GreaterThan, _) => false,
+                (Equal, Ordering::Equal) => true,
+                (Equal, _) => false,
+                (Distinct, Ordering::Equal) => false,
+                (Distinct, _) => true,
+                (In, _) => {
+                    return Err(Error::generic(
+                        "IN operator not supported for collation-aware comparison",
+                    ))
+                }
+            };
+
+            eprintln!("[Row {}]   Before inversion: {}", i, comparison_result);
+
+            // Apply inversion if needed
+            let final_result = if inverted {
+                !comparison_result
+            } else {
+                comparison_result
+            };
+
+            eprintln!("[Row {}]   Final result: {}", i, final_result);
+
+            Some(final_result)
+        };
+
+        result_builder.push(result);
+    }
+
+    eprintln!("========================================\n");
+
+    Ok(BooleanArray::from(result_builder))
 }
 
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
@@ -335,8 +474,11 @@ pub fn evaluate_predicate(
             };
             Ok(eval_op_fn(&arr)?)
         }
-        Binary(BinaryPredicate { op, left, right, context: _ }) => {
+        Binary(BinaryPredicate { op, left, right, context }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
+
+            // Check if we have a collation context for string comparisons
+            let collation_opt = context.as_ref().and_then(|ctx| ctx.collation.as_ref());
 
             // IN is different from all the others, and also quite complex, so factor it out.
             //
@@ -410,6 +552,23 @@ pub fn evaluate_predicate(
 
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
+
+            // If we have a collation context and both operands are strings, use collation-aware comparison
+            if let Some(collation) = collation_opt {
+                if let (Some(left_str), Some(right_str)) = (
+                    left.as_string_opt::<i32>(),
+                    right.as_string_opt::<i32>(),
+                ) {
+                    return Ok(compare_strings_with_collation(
+                        left_str,
+                        right_str,
+                        collation,
+                        op,
+                        inverted,
+                    )?);
+                }
+            }
+
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
@@ -1149,4 +1308,131 @@ mod tests {
         validate_i32_column(nested_struct_result, 0, &[1, 2, 3]);
         validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
     }
+}
+
+/// Access an element in a map array by key
+fn element_at_map(map_array: ArrayRef, key_array: ArrayRef) -> DeltaResult<ArrayRef> {
+    use crate::arrow::array::MapArray;
+
+    eprintln!("[element_at_map] Called with map_array type: {:?}, key_array type: {:?}", map_array.data_type(), key_array.data_type());
+
+    let map_array = map_array
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| Error::generic("element_at: first argument must be a Map"))?;
+
+    eprintln!("[element_at_map] Successfully downcast to MapArray, len = {}", map_array.len());
+
+    // For now, we only support scalar (constant) keys
+    let key = match key_array.as_any().downcast_ref::<StringArray>() {
+        Some(str_arr) if str_arr.len() == 1 => {
+            str_arr.value(0)
+        }
+        Some(str_arr) if str_arr.len() > 0 => {
+            let first_key = str_arr.value(0);
+            if str_arr.iter().all(|k| k == Some(first_key)) {
+                first_key
+            } else {
+                return Err(Error::generic("element_at: second argument must be a scalar string key (all values must be the same)"));
+            }
+        }
+        _ => return Err(Error::generic("element_at: second argument must be a scalar string key")),
+    };
+
+    eprintln!("[element_at_map] Looking for key: '{}'", key);
+
+    // MapArray structure: contains a StructArray with "keys" and "values" fields
+    let entries = map_array.entries();
+    eprintln!("[element_at_map] Got entries struct with {} columns", entries.num_columns());
+
+    let keys = entries.column_by_name("key")
+        .ok_or_else(|| Error::generic("Map entries missing 'key' field"))?;
+    eprintln!("[element_at_map] Got keys column");
+
+    let values = entries.column_by_name("value")
+        .ok_or_else(|| Error::generic("Map entries missing 'value' field"))?;
+    eprintln!("[element_at_map] Got values column");
+
+    let keys_array = keys
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::generic("Map keys must be strings"))?;
+    eprintln!("[element_at_map] Keys array length: {}", keys_array.len());
+
+    // Build result array: for each row in the map, find the matching key and extract its value
+    let num_rows = map_array.len();
+    eprintln!("[element_at_map] Map has {} rows", num_rows);
+    let mut result_data = vec![];
+    let mut nulls = NullBufferBuilder::new(num_rows);
+
+    for row_idx in 0..num_rows {
+        if map_array.is_null(row_idx) {
+            // Map is null, result is null
+            nulls.append_null();
+            result_data.push(None);
+            continue;
+        }
+
+        let start = map_array.value_offsets()[row_idx] as usize;
+        let end = map_array.value_offsets()[row_idx + 1] as usize;
+
+        eprintln!("[element_at_map] Row {}: Map has {} entries (indices {} to {})", row_idx, end - start, start, end - 1);
+
+        // Search for the key in this map's entries
+        let mut found = false;
+        for entry_idx in start..end {
+            let entry_key = keys_array.value(entry_idx);
+            eprintln!("[element_at_map] Row {}, entry {}: key = '{}'", row_idx, entry_idx, entry_key);
+            if entry_key == key {
+                result_data.push(Some(entry_idx));
+                nulls.append_non_null();
+                found = true;
+                eprintln!("[element_at_map] Row {}: Found key '{}' at entry {}", row_idx, key, entry_idx);
+                break;
+            }
+        }
+
+        if !found {
+            // Key not found, result is null
+            eprintln!("[element_at_map] Row {}: Key '{}' not found in map (searched {} entries)", row_idx, key, end - start);
+            nulls.append_null();
+            result_data.push(None);
+        }
+    }
+
+    // Build the result array by selecting the found indices from values
+    let values_data = values.to_data();
+    let mut builder = MutableArrayData::new(vec![&values_data], true, num_rows);
+    for (_row_idx, maybe_entry_idx) in result_data.iter().enumerate() {
+        if let Some(entry_idx) = maybe_entry_idx {
+            builder.extend(0, *entry_idx, *entry_idx + 1);
+        } else {
+            // Append a null value
+            builder.extend_nulls(1);
+        }
+    }
+
+    let result_data = builder.freeze();
+    let result_array = make_array(result_data);
+    eprintln!("[element_at_map] Returning result array with {} rows", result_array.len());
+    Ok(result_array)
+}
+
+/// Access nested fields in a struct array
+fn access_struct_fields(struct_array: ArrayRef, field_names: &[String]) -> DeltaResult<ArrayRef> {
+    let mut current = struct_array;
+
+    for field_name in field_names {
+        let struct_arr = current
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::generic(format!("Expected struct array for field access '{}'", field_name)))?;
+
+        current = struct_arr
+            .column_by_name(field_name)
+            .ok_or_else(|| Error::generic(format!("Field '{}' not found in struct", field_name)))?
+            .clone();
+    }
+
+    Ok(current)
 }

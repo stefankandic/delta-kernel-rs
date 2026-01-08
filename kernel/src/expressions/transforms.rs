@@ -274,7 +274,7 @@ pub trait ExpressionTransform<'a> {
     ) -> Option<Cow<'a, BinaryPredicate>> {
         let left = self.transform_expr(&b.left)?;
         let right = self.transform_expr(&b.right)?;
-        let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
+        let f = |(left, right)| b.with_expressions(left, right);
         Some((left, right).map_owned_or_else(b, f))
     }
 

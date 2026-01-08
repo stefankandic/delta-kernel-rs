@@ -33,6 +33,21 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
         predicate: &Predicate,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self {
+        // Transform predicate for parquet row group filtering by removing parts with
+        // non-binary collations. Parquet stats use binary comparison, which would
+        // incorrectly filter out row groups for case-insensitive collations.
+        //
+        // Examples:
+        // - `x > 5 AND y = 'b'` (collation on y) → Filter on `x > 5` only
+        // - `x > 5 OR y = 'b'` (collation on y) → Can't filter (return all row groups)
+        let parquet_predicate = match predicate.for_parquet_row_group_filter() {
+            Some(pred) => pred,
+            None => {
+                debug!("Skipping row group filter - predicate has non-binary collation: {predicate:#?}");
+                return self; // Return all row groups without filtering
+            }
+        };
+
         let ordinals: Vec<_> = self
             .metadata()
             .row_groups()
@@ -40,10 +55,10 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             .enumerate()
             .filter_map(|(ordinal, row_group)| {
                 // If the group survives the filter, return Some(ordinal) so filter_map keeps it.
-                RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
+                RowGroupFilter::apply(row_group, &parquet_predicate).then_some(ordinal)
             })
             .collect();
-        debug!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
+        debug!("with_row_group_filter({predicate:#?}) transformed to ({parquet_predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }

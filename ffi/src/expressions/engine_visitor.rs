@@ -619,10 +619,16 @@ fn visit_expression_impl(
             for expr in exprs {
                 visit_expression_impl(visitor, expr, child_list_id);
             }
-            let visit_fn = match op {
-                VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
-            };
-            visit_fn(visitor.data, sibling_list_id, child_list_id);
+            match op {
+                VariadicExpressionOp::Coalesce => {
+                    let visit_fn = visitor.visit_coalesce;
+                    visit_fn(visitor.data, sibling_list_id, child_list_id);
+                }
+                VariadicExpressionOp::ElementAt | VariadicExpressionOp::StructField => {
+                    // These are internal operations for stats access, not exposed through FFI
+                    panic!("ElementAt and StructField are internal operations not supported through FFI visitor")
+                }
+            }
         }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)
