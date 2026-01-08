@@ -3,21 +3,6 @@
 //! This module provides the factory pattern for creating collation instances that perform
 //! string comparisons according to specified collation rules.
 //!
-//! ## Implementation
-//!
-//! Uses raw ICU 4C 75.1 FFI bindings (not rust_icu) for full control over ICU version and linking.
-//! ICU is statically linked, eliminating runtime library dependencies.
-//!
-//! ## Caching
-//!
-//! Like Spark's CollationFactory which caches collation instances in a ConcurrentHashMap,
-//! this implementation caches Collation instances with thread-safe access.
-//!
-//! - Cache key: lowercased collation name (e.g., "unicode", "en_us_ci")
-//! - Case-insensitive: "UNICODE" and "unicode" map to the same entry
-//! - Provider and version NOT included in cache key
-//! - ICU collators are wrapped in `Arc<Mutex<>>` for thread-safe access
-//! - Collators are locked during comparison operations (similar to synchronized access in Java)
 
 use crate::collation::{CollationIdentifier, CollationProvider};
 use crate::icu_ffi;
@@ -511,15 +496,124 @@ impl ParsedLocale {
 static COLLATION_CACHE: LazyLock<RwLock<HashMap<String, Arc<Collation>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Converts Spark collation name to ICU locale string with keywords.
+///
+/// Converts from Spark format (e.g., `de_CI_AI`) to ICU format (e.g., `de@colStrength=primary`)
+/// for use with ICU collator APIs.
+///
+/// # Spark Modifiers (case-insensitive)
+///
+/// - _CI: Case insensitive
+/// - _CS: Case sensitive (explicit, default)
+/// - _AI: Accent insensitive
+/// - _AS: Accent sensitive (explicit, default)
+///
+/// # ICU Mapping
+///
+/// - CI + AI → PRIMARY strength (ignores case and accents)
+/// - CI + AS → SECONDARY strength (ignores case, considers accents)
+/// - CS + AI → PRIMARY strength + case level ON (considers case, ignores accents)
+/// - CS + AS → TERTIARY strength (considers case and accents, default)
+fn to_icu_locale_string(name: &str) -> String {
+    let upper = name.to_uppercase();
+    let mut locale = name.to_string();
+
+    // Parse sensitivity modifiers (case-insensitive, order independent)
+    // Default: case sensitive, accent sensitive (if no modifier specified)
+    let mut case_sensitive = true;
+    let mut accent_sensitive = true;
+
+    let has_ci = upper.contains("_CI");
+    let has_cs = upper.contains("_CS");
+    let has_ai = upper.contains("_AI");
+    let has_as = upper.contains("_AS");
+
+    // Determine case sensitivity: only change from default if explicitly specified
+    if has_ci {
+        case_sensitive = false;
+    } else if has_cs {
+        case_sensitive = true;
+    }
+    // If neither _CI nor _CS specified, keep default (true)
+
+    // Determine accent sensitivity: only change from default if explicitly specified
+    if has_ai {
+        accent_sensitive = false;
+    } else if has_as {
+        accent_sensitive = true;
+    }
+    // If neither _AI nor _AS specified, keep default (true)
+
+    // Strip all possible suffix combinations (case-insensitive)
+    // Order matters: check longer suffixes first
+    if upper.ends_with("_CI_AI") || upper.ends_with("_CS_AS") ||
+       upper.ends_with("_AI_CI") || upper.ends_with("_AS_CS") ||
+       upper.ends_with("_CI_AS") || upper.ends_with("_CS_AI") ||
+       upper.ends_with("_AI_CS") || upper.ends_with("_AS_CI") {
+        locale.truncate(locale.len() - 6);
+    } else if upper.ends_with("_CI") || upper.ends_with("_AI") ||
+              upper.ends_with("_CS") || upper.ends_with("_AS") {
+        locale.truncate(locale.len() - 3);
+    }
+
+    // Map to ICU strength and options
+    // Note: rust_icu uses older @ parameter format, not Unicode locale keywords
+    // Spark uses programmatic LocaleBuilder API with setUnicodeLocaleKeyword
+    // but rust_icu parses string format, so we use colStrength/colCaseLevel
+    //
+    // Reference: https://unicode-org.github.io/icu/userguide/collation/concepts.html#comparison-levels
+    match (case_sensitive, accent_sensitive) {
+        (false, false) => {
+            // CI + AI: primary strength (ignores case and accents)
+            locale.push_str("@colStrength=primary");
+        }
+        (false, true) => {
+            // CI + AS: secondary strength (ignores case, considers accents)
+            locale.push_str("@colStrength=secondary");
+        }
+        (true, false) => {
+            // CS + AI: primary strength + case level (considers case, ignores accents)
+            // Examples: "unicode_AI", "unicode_CS_AI", "unicode_AI_CS"
+            // This matches Spark: ks=level1;kc=true
+            locale.push_str("@colStrength=primary;colCaseLevel=yes");
+        }
+        (true, true) => {
+            // CS + AS: tertiary strength (considers case and accents, this is the default)
+            // No need to add anything, tertiary is default
+        }
+    }
+
+    locale
+}
+
 /// Factory for creating collation instances from collation identifiers.
 pub struct CollationFactory;
 
 impl CollationFactory {
+    /// Checks if a collation identifier is supported by the kernel.
+    ///
+    /// - Spark UTF8_BINARY is always supported (standard binary comparison)
+    /// - Spark UTF8_LCASE is supported (requires ICU for exact Spark compatibility)
+    /// - ICU collations are supported if they pass validation (valid locale format and available in ICU)
+    pub fn is_supported(identifier: &CollationIdentifier) -> bool {
+        match &identifier.provider {
+            CollationProvider::Spark => {
+                // Only UTF8_BINARY and UTF8_LCASE are supported
+                identifier.is_spark_utf8_binary() || identifier.is_spark_utf8_lcase()
+            }
+            CollationProvider::Icu => {
+                // For ICU, validate the locale format and availability
+                ParsedLocale::parse(&identifier.name)
+                    .and_then(|parsed| parsed.validate_availability(&identifier.name))
+                    .is_ok()
+            }
+            CollationProvider::Other(_) => false,
+        }
+    }
+
     /// Normalizes a collation name for caching (just lowercases it).
     ///
     /// This provides case-insensitive caching so "UNICODE" and "unicode" map to the same entry.
-    /// We don't normalize modifiers or order - if someone uses "unicode_CI_AI" vs "unicode_AI_CI",
-    /// they'll get separate cache entries, which is fine.
     fn normalize_name(name: &str) -> String {
         name.to_lowercase()
     }
@@ -541,9 +635,6 @@ impl CollationFactory {
     ///
     /// Returns an error if the collation is not supported or cannot be created
     pub fn from_identifier(identifier: CollationIdentifier) -> DeltaResult<Arc<Collation>> {
-        // Validate that the collation is supported
-        identifier.validate_support()?;
-
         // Create cache key: just the normalized name (provider and version not needed)
         let cache_key = Self::normalize_name(&identifier.name);
 
@@ -556,6 +647,15 @@ impl CollationFactory {
             }
         }
 
+        // Cache miss - validate that the collation is supported.
+        if !Self::is_supported(&identifier) {
+            let msg = format!(
+                "Collation '{}' is not supported. Supported: spark.UTF8_BINARY, spark.UTF8_LCASE, and valid ICU collations.",
+                identifier
+            );
+            return Err(crate::Error::unsupported(msg));
+        }
+
         // Not in cache - create new collation (write lock)
         let mut cache = COLLATION_CACHE.write().unwrap();
 
@@ -564,12 +664,7 @@ impl CollationFactory {
             return Ok(Arc::clone(cached_collation));
         }
 
-        // Parse and validate (expensive operation for ICU)
-        if let CollationProvider::Icu = &identifier.provider {
-            ParsedLocale::parse(&identifier.name)?;
-        }
-
-        // Create the collation
+        // Create the collation (validation already done, so create_icu_collation can skip validation)
         let collation = match &identifier.provider {
             CollationProvider::Spark => Self::create_spark_collation(identifier)?,
             CollationProvider::Icu => Self::create_icu_collation(identifier)?,
@@ -605,16 +700,12 @@ impl CollationFactory {
         })
     }
 
-    /// Creates an ICU collation by parsing and validating the locale components.
+    /// Creates an ICU collation.
+    ///
+    /// Assumes validation has already been done by `is_supported()`.
     fn create_icu_collation(identifier: CollationIdentifier) -> DeltaResult<Collation> {
-        // Parse the collation name into components
-        let parsed = ParsedLocale::parse(&identifier.name)?;
-
-        // Validate that the locale components are available in ICU
-        parsed.validate_availability(&identifier.name)?;
-
         // Convert Spark format to ICU format and create collator
-        let icu_locale = identifier.to_icu_locale_string();
+        let icu_locale = to_icu_locale_string(&identifier.name);
 
         // Create ICU collator and wrap in Arc<Mutex<>> for thread-safe access
         let collator = icu_ffi::Collator::try_new(&icu_locale).map_err(|e| {
@@ -634,6 +725,27 @@ impl CollationFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_to_icu_locale_string_conversion() {
+        // Test Spark format to ICU format conversion
+        // rust_icu uses @ parameter format (colStrength, colCaseLevel)
+
+        // Base locale (no modifiers) - use 3-letter country code
+        assert_eq!(to_icu_locale_string("en_USA"), "en_USA");
+
+        // Case insensitive - use 3-letter country code
+        assert_eq!(to_icu_locale_string("en_USA_CI"), "en_USA@colStrength=secondary");
+
+        // Accent insensitive (CS+AI: colStrength=primary;colCaseLevel=yes)
+        assert_eq!(to_icu_locale_string("de_AI"), "de@colStrength=primary;colCaseLevel=yes");
+
+        // Both case and accent insensitive
+        assert_eq!(to_icu_locale_string("de_CI_AI"), "de@colStrength=primary");
+
+        // Unicode root collation with case insensitive
+        assert_eq!(to_icu_locale_string("unicode_CI"), "unicode@colStrength=secondary");
+    }
 
     #[test]
     fn test_utf8_binary_collation() {
@@ -733,6 +845,26 @@ mod tests {
             assert!(collation.equals("Müller", "Muller").unwrap());
             assert!(collation.equals("müller", "muller").unwrap());
         }
+    }
+
+    #[test]
+    fn test_rtrim_collations_not_supported() {
+        // UTF8_LCASE_RTRIM and similar rtrim collations should not be supported
+        let identifier = CollationIdentifier::spark("UTF8_LCASE_RTRIM");
+        assert!(!CollationFactory::is_supported(&identifier));
+
+        let result = CollationFactory::from_identifier(identifier);
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(err.to_string().contains("not supported"));
+        }
+
+        // UTF8_BINARY_RTRIM should also not be supported
+        let identifier = CollationIdentifier::spark("UTF8_BINARY_RTRIM");
+        assert!(!CollationFactory::is_supported(&identifier));
+
+        let result = CollationFactory::from_identifier(identifier);
+        assert!(result.is_err());
     }
 
     #[test]

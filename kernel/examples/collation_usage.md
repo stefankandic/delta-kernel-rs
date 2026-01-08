@@ -165,13 +165,13 @@ let pred = column_expr!("name")
     .eq_collated("Alice", CollationIdentifier::spark("UTF8_LCASE"));
 
 println!("{}", pred);
-// Output: name = 'Alice' COLLATE spark:UTF8_LCASE
+// Output: name = 'Alice' COLLATE spark.UTF8_LCASE
 
 let pred = column_expr!("name")
     .eq_collated("Berlin", CollationIdentifier::icu("de_DE", Some("75.1".to_string())));
 
 println!("{}", pred);
-// Output: name = 'Berlin' COLLATE icu:de_DE:75.1
+// Output: name = 'Berlin' COLLATE icu.de_DE.75.1
 ```
 
 ## JSON Serialization
@@ -192,30 +192,26 @@ let json = serde_json::to_string(&collation).unwrap();
 // {"provider":"spark","name":"UTF8_LCASE"}
 ```
 
-## ICU Builder API (New)
+## ICU Collation with Sensitivity Modifiers
 
-The builder API provides a convenient way to create ICU collations with case and accent sensitivity options.
+ICU collations support fine-grained control over string comparison behavior using `_CI` (case-insensitive) and `_AI` (accent-insensitive) suffixes.
 
 ### Case-Insensitive Collation
 
 ```rust
 // Case-insensitive English collation (a == A)
-let collation = CollationIdentifier::icu_builder("en_US")
-    .case_sensitive(false)
-    .build();
+let collation = CollationIdentifier::icu("en_US_CI", None);
 
-// Result: "icu:en_US_CI"
+// Result: "icu.en_US_CI"
 ```
 
 ### Accent-Insensitive Collation
 
 ```rust
 // Accent-insensitive French collation (é == e)
-let collation = CollationIdentifier::icu_builder("fr_CAN")
-    .accent_sensitive(false)
-    .build();
+let collation = CollationIdentifier::icu("fr_CAN_AI", None);
 
-// Result: "icu:fr_CAN_AI"
+// Result: "icu.fr_CAN_AI"
 ```
 
 ### Case and Accent Insensitive
@@ -223,62 +219,47 @@ let collation = CollationIdentifier::icu_builder("fr_CAN")
 ```rust
 // Both case and accent insensitive German collation
 // So 'Ä', 'A', and 'a' are all considered equal
-let collation = CollationIdentifier::icu_builder("de")
-    .case_sensitive(false)
-    .accent_sensitive(false)
-    .build();
+let collation = CollationIdentifier::icu("de_CI_AI", None);
 
-// Result: "icu:de_CI_AI"
+// Result: "icu.de_CI_AI"
 ```
 
 ### Root Unicode Collation
 
 ```rust
 // Root/universal collation
-let unicode = CollationIdentifier::icu_builder("unicode").build();
-// Result: "icu:unicode"
+let unicode = CollationIdentifier::icu("unicode", None);
+// Result: "icu.unicode"
 
 // Case-insensitive unicode
-let unicode_ci = CollationIdentifier::icu_builder("unicode")
-    .case_sensitive(false)
-    .build();
-// Result: "icu:unicode_CI"
+let unicode_ci = CollationIdentifier::icu("unicode_CI", None);
+// Result: "icu.unicode_CI"
 
 // Case and accent insensitive unicode
-let unicode_ci_ai = CollationIdentifier::icu_builder("unicode")
-    .case_sensitive(false)
-    .accent_sensitive(false)
-    .build();
-// Result: "icu:unicode_CI_AI"
+let unicode_ci_ai = CollationIdentifier::icu("unicode_CI_AI", None);
+// Result: "icu.unicode_CI_AI"
 ```
 
 ### Multiple Locales
 
 ```rust
 // Japanese case-insensitive
-let jp_collation = CollationIdentifier::icu_builder("ja_JP")
-    .case_sensitive(false)
-    .build();
-// Result: "icu:ja_JP_CI"
+let jp_collation = CollationIdentifier::icu("ja_JP_CI", None);
+// Result: "icu.ja_JP_CI"
 
 // Traditional Chinese (Macao) with modifiers
-let zh_collation = CollationIdentifier::icu_builder("zh_Hant_MAC")
-    .case_sensitive(false)
-    .accent_sensitive(false)
-    .build();
-// Result: "icu:zh_Hant_MAC_CI_AI"
+let zh_collation = CollationIdentifier::icu("zh_Hant_MAC_CI_AI", None);
+// Result: "icu.zh_Hant_MAC_CI_AI"
 ```
 
-### Builder with Predicates
+### Predicates with Sensitivity Modifiers
 
 ```rust
 use delta_kernel::expressions::{column_expr, Predicate};
 use delta_kernel::collation::CollationIdentifier;
 
 // Create case-insensitive search
-let collation = CollationIdentifier::icu_builder("en_US")
-    .case_sensitive(false)
-    .build();
+let collation = CollationIdentifier::icu("en_US_CI", None);
 
 let pred = column_expr!("email").eq_collated("user@example.com", collation);
 // Matches: "USER@EXAMPLE.COM", "User@Example.Com", etc.
@@ -286,9 +267,9 @@ let pred = column_expr!("email").eq_collated("user@example.com", collation);
 
 ## Collation Name Format
 
-The builder generates Spark/Databricks format names with `_CI` and `_AI` suffixes:
+Collation names use Spark format with `_CI` and `_AI` suffixes:
 
-| Configuration | Spark/Databricks Format | ICU Conversion | Behavior |
+| Configuration | Spark Format | ICU Conversion | Behavior |
 |--------------|------------------------|----------------|----------|
 | Default | `en_US` | `en_US` | Case-sensitive, accent-sensitive |
 | Case-insensitive | `en_US_CI` | `en_US@colStrength=secondary` | Case-insensitive, accent-sensitive |
@@ -298,11 +279,11 @@ The builder generates Spark/Databricks format names with `_CI` and `_AI` suffixe
 | Unicode CI | `unicode_CI` | `unicode@colStrength=secondary` | Case-insensitive root |
 
 The Spark format (`_CI`/`_AI`) is used for storage and display. When creating ICU collators,
-the format is converted to ICU keywords automatically via `to_icu_locale_string()`.
+the format is converted to ICU keywords automatically by the collation factory.
 
 ## Supported Locales
 
-Collation names follow Spark/Databricks semantics using ICU locale identifiers:
+Collation names follow Spark semantics using ICU locale identifiers:
 
 **Format**: `language[_Script][_Country]`
 
@@ -316,28 +297,26 @@ Collation names follow Spark/Databricks semantics using ICU locale identifiers:
 
 ```rust
 // Root/universal collation
-CollationIdentifier::icu_builder("unicode")      // Universal/root collation
-CollationIdentifier::icu_builder("unicode_CI")   // Case-insensitive universal
+CollationIdentifier::icu("unicode", None)         // Universal/root collation
+CollationIdentifier::icu("unicode_CI", None)      // Case-insensitive universal
 
 // Language only
-CollationIdentifier::icu_builder("en")
-CollationIdentifier::icu_builder("en_CI")        // Case-insensitive English
+CollationIdentifier::icu("en", None)
+CollationIdentifier::icu("en_CI", None)           // Case-insensitive English
 
 // Language + 2-letter country
-CollationIdentifier::icu_builder("en_US")        // English (United States)
-CollationIdentifier::icu_builder("de_DE_CI_AI")  // German (Germany), case + accent insensitive
+CollationIdentifier::icu("en_US", None)           // English (United States)
+CollationIdentifier::icu("de_DE_CI_AI", None)    // German (Germany), case + accent insensitive
 
-// Language + 3-letter country (Databricks format)
-CollationIdentifier::icu_builder("fr_CAN")       // French (Canada)
-CollationIdentifier::icu_builder("en_GBR_CI")    // English (Great Britain), case-insensitive
+// Language + 3-letter country (Spark format)
+CollationIdentifier::icu("fr_CAN", None)          // French (Canada)
+CollationIdentifier::icu("en_GBR_CI", None)       // English (Great Britain), case-insensitive
 
 // Language + Script + Country
-CollationIdentifier::icu_builder("zh_Hant_MAC")  // Traditional Chinese (Macao)
-CollationIdentifier::icu_builder("sr_Cyrl_RS")   // Serbian (Cyrillic, Serbia)
-CollationIdentifier::icu_builder("sr_Latn_RS")   // Serbian (Latin, Serbia)
+CollationIdentifier::icu("zh_Hant_MAC", None)     // Traditional Chinese (Macao)
+CollationIdentifier::icu("sr_Cyrl_RS", None)      // Serbian (Cyrillic, Serbia)
+CollationIdentifier::icu("sr_Latn_RS", None)      // Serbian (Latin, Serbia)
 ```
-
-See [Databricks Collation Reference](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-collation) for full specification.
 
 ## Notes
 
@@ -345,4 +324,4 @@ See [Databricks Collation Reference](https://docs.databricks.com/aws/en/sql/lang
 - **String operations only**: Collation only affects string comparisons; numeric/date comparisons are unaffected
 - **Backward compatible**: Existing code without collations continues to work unchanged
 - **Provider + name + version**: The three-part identifier ensures precise collation semantics across systems
-- **Builder API**: Use `icu_builder()` for fine-grained control over case/accent sensitivity
+- **Sensitivity modifiers**: Use `_CI` and `_AI` suffixes for fine-grained control over case/accent sensitivity
