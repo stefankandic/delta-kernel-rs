@@ -135,8 +135,12 @@ pub(crate) enum TableFeature {
     /// Column Default Values.
     AllowColumnDefaults,
     /// Collation metadata for string columns.
+    ///
+    /// Kernel preserves `__COLLATIONS` but uses UTF-8 binary semantics for string predicates
+    /// and file skipping. Callers must not translate collation-aware comparisons into ordinary
+    /// binary comparisons for skipping, since doing so can discard matching files.
     Collations,
-    /// Preview collation metadata for string columns.
+    /// Preview form of [`Self::Collations`], with the same predicate restrictions.
     #[strum(serialize = "collations-preview")]
     #[serde(rename = "collations-preview")]
     CollationsPreview,
@@ -908,8 +912,8 @@ pub(crate) fn add_feature_to_lists(
 /// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
 /// satisfied by `table_properties`, appending it to `reader_features`/`writer_features`
 /// (deduplicated). Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they need
-/// no property-driven enablement. `RowTracking` additionally pulls in its `DomainMetadata`
-/// dependency.
+/// no property-driven enablement. Ensures `DomainMetadata` is present when a selected feature
+/// requires it.
 pub(crate) fn auto_enable_property_driven_features(
     allowed_table_features: &[TableFeature],
     table_properties: &TableProperties,
@@ -920,15 +924,38 @@ pub(crate) fn auto_enable_property_driven_features(
         if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
             if check(table_properties) {
                 add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
-                if *table_feature == TableFeature::RowTracking {
-                    add_feature_to_lists(
-                        TableFeature::DomainMetadata,
-                        reader_features,
-                        writer_features,
-                    );
-                }
             }
         }
+    }
+    ensure_domain_metadata_dependency(reader_features, writer_features);
+}
+
+/// Adds domain metadata support when a selected feature requires it.
+pub(crate) fn ensure_domain_metadata_dependency(
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    let required = reader_features
+        .iter()
+        .chain(writer_features.iter())
+        .any(|feature| {
+            feature
+                .info()
+                .feature_requirements
+                .iter()
+                .any(|requirement| {
+                    matches!(
+                        requirement,
+                        FeatureRequirement::Supported(TableFeature::DomainMetadata)
+                    )
+                })
+        });
+    if required {
+        add_feature_to_lists(
+            TableFeature::DomainMetadata,
+            reader_features,
+            writer_features,
+        );
     }
 }
 

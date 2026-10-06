@@ -682,7 +682,7 @@ fn test_create_table_with_feature_signal(
     }
     if matches!(
         feature,
-        TableFeature::Collations | TableFeature::CollationsPreview
+        TableFeature::RowTracking | TableFeature::Collations | TableFeature::CollationsPreview
     ) {
         assert!(table_config.is_feature_supported(&TableFeature::DomainMetadata));
     }

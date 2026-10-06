@@ -20,9 +20,10 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
-    StaleAnnotationPolicy,
+    StaleAnnotationPolicy, TableFeature,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::{require, CollectInto};
@@ -225,7 +226,11 @@ impl Display for MetadataValue {
 
 #[derive(Debug)]
 pub enum ColumnMetadataKey {
-    /// Collation identifiers keyed by field path.
+    /// Collation identifiers keyed by field path, stored as a JSON object.
+    ///
+    /// Kernel preserves this metadata without interpreting the identifiers. String predicates and
+    /// data skipping use UTF-8 binary semantics.
+    /// See the [collation RFC](https://github.com/delta-io/delta/pull/3068).
     Collations,
     ColumnMappingId,
     ColumnMappingPhysicalName,
@@ -730,6 +735,12 @@ impl StructField {
     pub(crate) fn has_invariants(&self) -> bool {
         self.metadata
             .contains_key(ColumnMetadataKey::Invariants.as_ref())
+    }
+
+    /// Returns whether this field carries `__COLLATIONS` metadata.
+    pub(crate) fn has_collations(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::Collations.as_ref())
     }
 
     /// Converts logical schema StructField metadata to physical schema metadata
@@ -1565,10 +1576,7 @@ impl<'a> SchemaTransform<'a> for CollationMetadataChecker {
     transform_output_type!(|'a, T| Result<(), ()>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
-        if field
-            .metadata()
-            .contains_key(ColumnMetadataKey::Collations.as_ref())
-        {
+        if field.has_collations() {
             Err(())
         } else {
             self.recurse_into_struct_field(field)
@@ -1579,6 +1587,27 @@ impl<'a> SchemaTransform<'a> for CollationMetadataChecker {
 /// Returns whether any field carries `__COLLATIONS` metadata.
 pub(crate) fn schema_has_collations(schema: &Schema) -> bool {
     CollationMetadataChecker.transform_struct(schema).is_err()
+}
+
+/// Rejects schemas with collation metadata unless the protocol declares a collations feature.
+///
+/// This consistency check also applies to reads, even though collations is writer-only.
+pub(crate) fn validate_collations_feature_support(
+    table_config: &TableConfiguration,
+) -> DeltaResult<()> {
+    let protocol = table_config.protocol();
+    if !protocol.has_table_feature(&TableFeature::Collations)
+        && !protocol.has_table_feature(&TableFeature::CollationsPreview)
+    {
+        require!(
+            !schema_has_collations(table_config.logical_schema_ref().as_ref()),
+            Error::unsupported(
+                "Table contains collation metadata but requires the 'collations' or \
+                 'collations-preview' table feature"
+            )
+        );
+    }
+    Ok(())
 }
 
 /// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
@@ -3564,6 +3593,35 @@ mod tests {
                     MetadataValue::Other(serde_json::json!({ "value": "spark.UTF8_LCASE" })),
                 )])),
             },
+        },
+        true
+    )]
+    #[case::array_element_struct(
+        schema! {
+            nullable "items": (ArrayType::new(
+                schema! {
+                    (StructField::nullable("name", DataType::STRING).with_metadata([(
+                        ColumnMetadataKey::Collations.as_ref(),
+                        MetadataValue::Other(serde_json::json!({ "name": "spark.UTF8_LCASE" })),
+                    )])),
+                },
+                true,
+            )),
+        },
+        true
+    )]
+    #[case::map_value_struct(
+        schema! {
+            nullable "items": (MapType::new(
+                DataType::STRING,
+                schema! {
+                    (StructField::nullable("name", DataType::STRING).with_metadata([(
+                        ColumnMetadataKey::Collations.as_ref(),
+                        MetadataValue::Other(serde_json::json!({ "name": "spark.UTF8_LCASE" })),
+                    )])),
+                },
+                true,
+            )),
         },
         true
     )]

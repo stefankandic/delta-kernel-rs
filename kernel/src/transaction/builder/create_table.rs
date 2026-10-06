@@ -26,10 +26,10 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
-    find_max_column_id_in_schema, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    strip_stray_column_mapping_metadata, ColumnMappingMode, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    ensure_domain_metadata_dependency, find_max_column_id_in_schema,
+    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
+    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata, ColumnMappingMode,
+    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
@@ -221,15 +221,11 @@ fn validate_clustering_and_make_domain_metadata(
 
     // Add required features
     add_feature_to_lists(
-        TableFeature::DomainMetadata,
-        reader_features,
-        writer_features,
-    );
-    add_feature_to_lists(
         TableFeature::ClusteredTable,
         reader_features,
         writer_features,
     );
+    ensure_domain_metadata_dependency(reader_features, writer_features);
 
     Ok(create_clustering_domain_metadata(logical_columns))
 }
@@ -339,12 +335,11 @@ fn apply_data_layout(
                 .try_collect()?;
 
             add_feature_to_lists(
-                TableFeature::DomainMetadata,
+                TableFeature::ClusteredTable,
                 &mut validated.reader_features,
                 &mut validated.writer_features,
             );
-            add_feature_to_lists(
-                TableFeature::ClusteredTable,
+            ensure_domain_metadata_dependency(
                 &mut validated.reader_features,
                 &mut validated.writer_features,
             );
@@ -395,27 +390,29 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     }
 }
 
-/// Adds the stable collation feature when a schema carries collation metadata.
+/// Enables collation support for schemas carrying `__COLLATIONS` metadata.
+///
+/// Adds `collations` only if neither the stable nor preview feature is already declared,
+/// and ensures `domainMetadata` is present.
 fn maybe_enable_collations(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
     if !schema_has_collations(schema) {
         return;
     }
 
-    let has_collations = validated
+    let has_collations_feature = validated
         .writer_features
         .contains(&TableFeature::Collations)
         || validated
             .writer_features
             .contains(&TableFeature::CollationsPreview);
-    if !has_collations {
+    if !has_collations_feature {
         add_feature_to_lists(
             TableFeature::Collations,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
     }
-    add_feature_to_lists(
-        TableFeature::DomainMetadata,
+    ensure_domain_metadata_dependency(
         &mut validated.reader_features,
         &mut validated.writer_features,
     );
@@ -778,17 +775,6 @@ fn validate_extract_table_features_and_properties(
             )));
         }
 
-        // These writer features require DomainMetadata as a dependency.
-        if matches!(
-            feature,
-            TableFeature::RowTracking | TableFeature::Collations | TableFeature::CollationsPreview
-        ) {
-            add_feature_to_lists(
-                TableFeature::DomainMetadata,
-                &mut reader_features,
-                &mut writer_features,
-            );
-        }
         // VariantShredding requires VariantType as a dependency
         if feature == TableFeature::VariantShredding {
             add_feature_to_lists(
@@ -801,6 +787,7 @@ fn validate_extract_table_features_and_properties(
         // Add to appropriate feature lists based on feature type
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
+    ensure_domain_metadata_dependency(&mut reader_features, &mut writer_features);
 
     // Validate remaining delta.* properties against the allow list
     for key in properties.keys() {
@@ -1620,6 +1607,9 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::row_tracking(TableFeature::RowTracking, "rowTracking")]
+    #[case::collations(TableFeature::Collations, "collations")]
+    #[case::collations_preview(TableFeature::CollationsPreview, "collations-preview")]
     #[case::variant_type(TableFeature::VariantType, "variantType")]
     #[case::variant_shredding(TableFeature::VariantShredding, "variantShredding")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
@@ -1646,6 +1636,15 @@ mod tests {
                 validated.reader_features.is_empty(),
                 "{feature:?} is WriterOnly but reader_features is not empty"
             ),
+        }
+        if matches!(
+            feature,
+            TableFeature::RowTracking | TableFeature::Collations | TableFeature::CollationsPreview
+        ) {
+            assert!(validated
+                .writer_features
+                .contains(&TableFeature::DomainMetadata));
+            assert_eq!(validated.writer_features.len(), 2);
         }
     }
 
@@ -1751,6 +1750,11 @@ mod tests {
                 "Expected {feature:?} in writer_features"
             );
         }
+        assert_eq!(
+            validated.writer_features.len(),
+            expectation.expected_writer_features.len()
+        );
+        assert!(validated.reader_features.is_empty());
     }
 
     #[rstest::rstest]
@@ -1917,6 +1921,20 @@ mod tests {
         HashMap::from([("delta.feature.rowTracking".to_string(), "supported".to_string())]),
         false, // enablement property is NOT set
     )]
+    #[case::feature_signal_and_property(
+        HashMap::from([
+            ("delta.feature.rowTracking".to_string(), "supported".to_string()),
+            (ENABLE_ROW_TRACKING.to_string(), "true".to_string()),
+        ]),
+        true,
+    )]
+    #[case::explicit_dependency(
+        HashMap::from([
+            ("delta.feature.rowTracking".to_string(), "supported".to_string()),
+            ("delta.feature.domainMetadata".to_string(), "supported".to_string()),
+        ]),
+        false,
+    )]
     fn test_row_tracking_activation_adds_required_features(
         #[case] properties: HashMap<String, String>,
         #[case] expect_enablement_property: bool,
@@ -1941,6 +1959,8 @@ mod tests {
             expect_enablement_property,
             "delta.enableRowTracking presence mismatch"
         );
+        assert_eq!(validated.writer_features.len(), 2);
+        assert!(validated.reader_features.is_empty());
     }
 
     #[test]
